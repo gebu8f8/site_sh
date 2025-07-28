@@ -98,7 +98,7 @@ jobs:
           diff_json=$(jq -Rs . <<< "$diff_text")
 
           json_payload=$(jq -n \
-            --arg system_msg "請用繁體中文，根據以下 diff 寫出 changelog 條列，不要開場白、不要說明文字、也不要提到版本更新，也不要提到 diff，僅條列使用-變更項目，簡短扼要。" \
+            --arg system_msg "請用繁體中文，根據以下 diff 寫出 changelog 條列，不要開場白、不要說明文字、也不要提到版本更新，也不要提到 diff，僅條列變更項目，簡短扼要。條列時請使用 - 作為項目前綴符號。" \
             --arg user_msg "$diff_text" \
             '{
               model: "deepseek/deepseek-chat-v3-0324:free",
