@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.7.0"
+version="6.7.1"
 
 
 # 顏色定義
@@ -4321,10 +4321,10 @@ while true; do
       fi
       ;;
     9)
-      if ! command -v docker_mgr >/dev/null 2>&1; then
+      if ! command -v d >/dev/null 2>&1; then
         bash <(curl -sL https://raw.githubusercontent.com/gebu8f8/docker_sh/refs/heads/main/install.sh)
       else
-        docker_mgr
+        d
       fi
       ;;
     0)
