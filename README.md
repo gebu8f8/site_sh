@@ -1,5 +1,16 @@
 # Nginx 全自動建站工具（支援 Certbot + WordPress）By gebu8f
 
+# 🔐 授權 License
+
+本專案以 [Apache License 2.0](./LICENSE) 授權，您可以自由使用、修改、商用或學術用途，條件如下：
+
+- **請保留原始作者署名（標註我）**
+- **若有修改，請明確標註變更**
+- **禁止移除授權資訊後冒充原作者**
+- **不提供任何保固或技術責任**
+
+違反者我將保留依法提出 DMCA 下架的權利。
+
 # 介紹
 
 這是一套純本地部署（非 Docker）的 Nginx + SSL + WordPress 自動化建站腳本，專為 VPS 多系統環境設計，支援 **Debian / CentOS / Alpine Linux** 三大主流系統，讓你一鍵完成完整建站流程。
