@@ -1,5 +1,13 @@
 # Nginx 全自動建站工具（支援 Certbot + WordPress）By gebu8f
 
+# 站點管理器所整合的所有腳本
+資料庫管理器：https://github.com/gebu8f8/db_sh
+
+防火牆管理器：https://github.com/gebu8f8/firewall_sh
+
+Docker管理器：
+https://github.com/gebu8f8/docker_sh
+
 # 🔐 授權 License
 
 本專案以 [Apache License 2.0](./LICENSE) 授權，您可以自由使用、修改、商用或學術用途，條件如下：
