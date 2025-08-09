@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.7.1"
+version="6.8.0"
 
 
 # 顏色定義
@@ -1353,73 +1353,6 @@ deploy_or_remove_theme() {
       ;;
   esac
 }
-enable_mysql_remote_root() {
-  echo "啟用 MySQL / MariaDB root 遠端登入..."
-  get_mysql_command
-
-  # 確認版本
-  local version=$("${MYSQL_CMD[@]}" -N -e "SELECT VERSION();" | head -n 1)
-  echo "偵測到版本：$version"
-
-  if [[ "$version" == *MariaDB* ]]; then
-    cnf_file="/etc/mysql/mariadb.conf.d/50-server.cnf"
-  else
-    cnf_file="/etc/mysql/mysql.conf.d/mysqld.cnf"
-  fi
-
-  # 修改 bind-address
-  if grep -q "^bind-address" "$cnf_file"; then
-    sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' "$cnf_file"
-  else
-    echo "bind-address = 0.0.0.0" >> "$cnf_file"
-  fi
-
-  echo -e "${GREEN}bind-address 已修改為 0.0.0.0${RESET}"
-
-  service mysql restart || service mariadb restart
-  echo -e "${GREEN}資料庫已重新啟動${RESET}"
-
-  # 檢查是否已有 root@%
-  local exists=$("${MYSQL_CMD[@]}" -N -e "SELECT COUNT(*) FROM mysql.user WHERE User='root' AND Host='%';")
-  if [[ "$exists" -eq 0 ]]; then
-    # 要求輸入強密碼
-    while :; do
-      read -s -p "請輸入 root@% 的密碼（8+位，含大小寫數字特殊符號，禁止 / 和 \\）： " new_pass
-      echo
-      if [[ ${#new_pass} -lt 8 ]]; then
-        echo -e "${RED}密碼太短，至少 8 位${RESET}"
-        continue
-      elif ! [[ "$new_pass" =~ [A-Z] ]]; then
-        echo -e "${RED}必須包含大寫字母${RESET}"
-        continue
-      elif ! [[ "$new_pass" =~ [a-z] ]]; then
-        echo -e "${RED}必須包含小寫字母${RESET}"
-        continue
-      elif ! [[ "$new_pass" =~ [0-9] ]]; then
-        echo -e "${RED}必須包含數字${RESET}"
-        continue
-      elif ! [[ "$new_pass" =~ [^\w] ]]; then
-        echo -e "${RED}必須包含特殊符號${RESET}"
-        continue
-      elif [[ "$new_pass" == *"/"* || "$new_pass" == *"\\"* ]]; then
-        echo -e "${RED}密碼不可包含 / 或 \\${RESET}"
-        continue
-      fi
-      break
-    done
-
-    echo -e "${CYAN}建立 root@% 帳戶...${RESET}"
-    "${MYSQL_CMD[@]}" -e "CREATE USER 'root'@'%' IDENTIFIED BY '$new_pass';"
-    "${MYSQL_CMD[@]}" -e "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;"
-    "${MYSQL_CMD[@]}" -e "FLUSH PRIVILEGES;"
-    echo -e "${GREEN}已建立 root@% 並授予權限${RESET}"
-  else
-    echo -e "${YELLOW}root@% 帳戶已存在，跳過建立${RESET}"
-  fi
-
-  echo -e "${GREEN}遠端 root 登入功能已完成，可由其他主機或 Docker 連線${RESET}"
-}
-
 
 flarum_setup() {
   local php_var=$(check_php_version)
@@ -1441,15 +1374,12 @@ flarum_setup() {
     local download_phpver="$max_supported_php"
   fi
 
-  if ! command -v mysql &>/dev/null; then
-    echo "MySQL 未安裝，正在安裝..."
-    bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/install.sh)
-    myadmin install
-    read -p "操作完成，請按任意鍵繼續" -n1
-    else
-      get_mysql_command
+  if ! command -v dba >/dev/null 2>&1; then
+    bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
   fi
-  echo
+  if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then
+    dba mysql install
+  fi
 
   if ! command -v composer &>/dev/null; then
     echo "正在安裝 Composer..."
@@ -1476,12 +1406,7 @@ flarum_setup() {
 
   local db_name="flarum_${domain//./_}"
   local db_user="${db_name}_user"
-  local db_pass=$(openssl rand -hex 12)
-
-  "${MYSQL_CMD[@]}" -e "CREATE DATABASE $db_name DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  "${MYSQL_CMD[@]}" -e "CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass';"
-  "${MYSQL_CMD[@]}" -e "GRANT ALL PRIVILEGES ON $db_name.* TO '$db_user'@'localhost';"
-  "${MYSQL_CMD[@]}" -e "FLUSH PRIVILEGES;"
+  local db_pass=$(dba mysql add $db_name $db_user false)
 
   # 下載 Flarum
   mkdir -p /var/www/$domain
@@ -1593,52 +1518,6 @@ get_nginx_run_user() {
     echo "$user"
   fi
 }
-
-# 全域變數 MYSQL_CMD（陣列）將會被設定為 mysql 指令
-MYSQL_CMD=()
-
-get_mysql_command() {
-    local mysql_root_pw=""
-    local pass_file="/etc/mysql-pass.conf"
-
-    # 嘗試無密碼登入
-    if mysql -u root -e "SELECT 1;" &>/dev/null; then
-        MYSQL_CMD=("mysql" "-u" "root")
-        return 0
-    fi
-
-    # 嘗試讀取 /etc/mysql-pass.conf
-    if [ -f "$pass_file" ]; then
-        mysql_root_pw=$(< "$pass_file")
-        if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-            MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
-            return 0
-        fi
-    fi
-
-    # 不存在 conf 或無效，請使用者輸入
-    while true; do
-        read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
-        echo
-        if [ -z "$mysql_root_pw" ]; then
-            >&2 echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
-            continue
-        fi
-
-        if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-            >&2 echo -e "${GREEN}密碼正確，已成功登入 MySQL${RESET}"
-            echo "$mysql_root_pw" > "$pass_file"
-            chmod 600 "$pass_file"
-            >&2 echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
-            MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
-            return 0
-        else
-            >&2 echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
-        fi
-    done
-}
-
-
 
 html_sites(){
   local ngx_user=$(get_nginx_run_user)
@@ -1983,79 +1862,6 @@ install_wpcli_if_needed() {
     echo "安裝完成，版本：$(wp --allow-root --version | head -n1)"
   fi
 }
-install_phpmyadmin() {
-  echo -e "${CYAN}開始安裝 phpMyAdmin ...${RESET}"
-
-  if ! command -v docker >/dev/null 2>&1; then
-    echo -e "${RED}您尚未安裝 Docker，請先安裝！${RESET} "
-    return 1
-  fi
-
-  # 檢查容器是否存在
-  if docker ps -a --format '{{.Names}}' | grep -q "^myadmin$"; then
-    echo -e "${YELLOW}偵測到已存在名為 myadmin 的容器，將先刪除...${RESET}"
-    docker rm -f myadmin
-  fi
-
-  # 取得隨機未被佔用的端口
-  while :; do
-    read -p "請輸入 phpMyAdmin 映射端口（留空自動隨機）： " port
-
-    if [[ -z "$port" ]]; then
-      local port=$(( ( RANDOM % (65535 - 1025) ) + 1025 ))
-      echo -e "${CYAN}自動選擇隨機端口：$port${RESET}"
-    fi
-
-    # 更嚴謹檢測
-    if ss -tuln | awk '{print $5}' | grep -qE ":$port\$"; then
-      echo -e  "${YELLOW}端口 $port 已被佔用，請重新輸入！${RESET}"
-    else
-      break
-    fi
-  done
-  read -p "是否要自動反向代理？（Y/n）" confirm
-  confirm=${confirm,,}
-  if [[ $confirm == y || $confirm == "" ]]; then
-    read -p "請輸入域名：" domain
-    docker run -d \
-    --restart always \
-    --name myadmin \
-    -p ${port}:80 \
-    -e PMA_HOST=host.docker.internal:172.17.0.1 \
-    -e PMA_PORT=3306 \
-    -e PMA_ABSOLUTE_URI=https://$domain \
-    phpmyadmin/phpmyadmin:latest
-    check_cert "$domain" || {
-      echo "未偵測到 Let's Encrypt 憑證，嘗試自動申請..."
-      if ssl_apply "$domain"; then
-        echo "申請成功，重新驗證憑證..."
-        check_cert "$domain" || {
-          echo "申請成功但仍無法驗證憑證，中止建立站點"
-          return 1
-        }
-      else
-        echo "SSL 申請失敗，中止建立站點"
-        return 1
-      fi
-    }
-    setup_site "$domain" proxy "127.0.0.1" "http" "$port"
-    enable_mysql_remote_root
-  else
-    docker run -d \
-    --name myadmin \
-    -p ${port}:80 \
-    -e PMA_HOST=host.docker.internal:172.17.0.1 \
-    -e PMA_PORT=3306 \
-    phpmyadmin/phpmyadmin:latest
-    enable_mysql_remote_root
-    echo "===== phpMyAdmin 連結信息 ====="
-    echo -e "${YELLOW}請妥善保存${RESET}"
-    echo ""
-    echo "連結地址：http://localhost:$port"
-    read -p "命令操作完成，請按任意鍵繼續..." -n1
-  fi
-}
-
 
 php_install() {
   echo -e "${CYAN}開始安裝 PHP 環境...${RESET}"
@@ -3608,15 +3414,12 @@ wordpress_site() {
     fi
     return 1
   fi
-  if ! command -v mysql &>/dev/null; then
-    echo "MySQL 未安裝，正在安裝..."
-    bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/install.sh)
-    myadmin install
-    read -p "操作完成，請按任意鍵繼續" -n1
-  else
-    get_mysql_command
+  if ! command -v dba >/dev/null 2>&1; then
+    bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
   fi
-  echo
+  if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then
+    dba mysql install
+  fi
   read -p "請輸入您的 WordPress 網址（例如 wp.example.com）：" domain
 
   # 自動申請 SSL（若不存在）
@@ -3649,12 +3452,7 @@ wordpress_site() {
 
   local db_name="wp_${domain//./_}"
   local db_user="${db_name}_user"
-  local db_pass=$(openssl rand -hex 12)
-
-  "${MYSQL_CMD[@]}" -e "CREATE DATABASE $db_name DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  "${MYSQL_CMD[@]}" -e "CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass';"
-  "${MYSQL_CMD[@]}" -e "GRANT ALL PRIVILEGES ON $db_name.* TO '$db_user'@'localhost';"
-  "${MYSQL_CMD[@]}" -e "FLUSH PRIVILEGES;"
+  local db_pass=$(dba mysql add $db_name $db_user false)
 
   # 設定 wp-config.php
   cp "/var/www/$domain/wp-config-sample.php" "/var/www/$domain/wp-config.php"
@@ -4043,12 +3841,10 @@ menu_php() {
     echo
     echo "10. 備份網站            11. 還原網站 "
     echo ""
-    echo "12. 安裝phpmyadmin"
-    echo ""
     echo "r. PHP一鍵配置（設定www配置文件至我腳本可用之狀態）"
     echo "-------------------"
     echo "0. 返回"
-    echo -n -e "\033[1;33m請選擇操作 [0-12]: \033[0m"
+    echo -n -e "\033[1;33m請選擇操作 [0-11]: \033[0m"
     read -r choice
     case $choice in
       1)
@@ -4143,9 +3939,6 @@ menu_php() {
       11)
         menu_restore_site
         read -p "操作完成，請按任意鍵繼續..." -n1
-        ;;
-      12)
-        install_phpmyadmin
         ;;
       r)
         php_fix
@@ -4310,14 +4103,13 @@ while true; do
       clean_nginx_ssl_config
       ;;
     8)
-      if ! command -v mysql >/dev/null 2>&1; then
-        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/install.sh)
-        myadmin
-      elif ! command -v myadmin >/dev/null 2>&1; then
-        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/install.sh)
-          myadmin
+      if ! command -v dba >/dev/null 2>&1; then
+        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
+      fi
+      if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then
+        dba mysql install
       else
-        myadmin
+        dba mysql
       fi
       ;;
     9)
