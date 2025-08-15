@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.8.0"
+version="6.9.0"
 
 
 # 顏色定義
@@ -423,14 +423,45 @@ check_cert() {
 #檢查nginx
 check_nginx_start(){
   if [[ $use_my_app = false && $port_in_use = false ]]; then
-    read -p "是否安裝nginx/openresy？（Y/n）" confirm
-    confirm=${confirm,,}
-    if [[ "$confirm" = y || -z "$confirm" ]]; then
-      install_nginx
-    else
-      echo "已取消安裝。"
-      return
-    fi
+    while true; do
+      clear
+      echo "=========站點管理器之安裝網站伺服器=========="
+      echo "1. 安裝nginx（支援HTTP3）"
+      echo "2. 安裝Openresy（支援LUA）【alpine 3.19以上（含）不支援】"
+      read -p "請選擇安裝的伺服器[1-2，預設為2]" choice
+      choice=${choice:-2}
+      case $choice in
+      1)
+        install_web_server nginx 
+        break
+        ;;
+      2)
+        if [ $system == 1 ]; then
+          local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          if [[ $os == kali ]]; then
+            local codename=bookworm
+          else
+            local codename=$(grep -Po 'VERSION="[0-9]+ \(\K[^)]+' /etc/os-release)
+          fi
+          if ! curl -sf "https://openresty.org/package/debian/dists/${codename}/" >/dev/null; then
+            echo -e "${RED}官方倉庫尚未支援 ${codename}${RESET}"
+            sleep 2
+          else
+            install_web_server openresty
+            break
+          fi
+        elif [ $system == 3 ]; then
+          if ! curl -sf https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main >/dev/null; then
+            echo -e "${RED}官方倉庫尚未支援${RESET}"
+            sleep 2
+          else
+            install_web_server openresty
+            break
+          fi
+        fi
+        ;;
+      esac
+    done
   fi
 }
 
@@ -475,14 +506,7 @@ check_nginx(){
     read -n1 -r -p "請處理完畢後再繼續，按任意鍵結束..." _
     return 1
   elif [[ $use_my_app = false && $port_in_use = false ]]; then
-    read -p "是否安裝nginx/openresy？（Y/n）" confirm
-    confirm=${confirm,,}
-    if [[ "$confirm" = y || -z "$confirm" ]]; then
-      install_nginx
-    else
-      echo "已取消安裝。"
-      return
-    fi
+    check_web_server
   else
     echo -e "${YELLOW}您已成功安裝，不用重複安裝${RESET}"
     read -p "操作完成，請按任意鍵繼續..." -n1
@@ -573,6 +597,16 @@ check_app(){
       3)
         apk add jq
         ;;
+    esac
+  fi
+  if ! command -v lsb_release &>/dev/null; then
+    case $system in
+    1)
+      apt update && apt install -y lsb-release
+      ;;
+    2)
+      yum install -y redhat-lsb-core
+      ;;
     esac
   fi
 }
@@ -1042,6 +1076,7 @@ clean_nginx_ssl_config() {
 }
 
 default(){
+  local mode=$1
   local detect_conf_path=$(detect_conf_path)
   create_directories
   generate_ssl_cert
@@ -1049,34 +1084,26 @@ default(){
   1|2)
     rm -f $detect_conf_path/default.conf $detect_conf_path/default
     wget -O /etc/nginx/conf.d/default.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/default_system
-    rm -f /etc/nginx/nginx.conf
-    wget -O /etc/nginx/nginx.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/nginx.conf
-    id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
-    systemctl restart openresty
+    if [ mode == openresty ]; then
+      rm -f /etc/nginx/nginx.conf
+      wget -O /etc/nginx/nginx.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/nginx.conf
+      id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
+    fi
+    restart_nginx_openresty
     ;;
   3)
-    mkdir -p /usr/local/share/lua/5.1
-    # download lua environment value
-    cd /usr/local/share/lua/5.1/
-    git clone https://github.com/openresty/lua-resty-core.git resty_core_temp || {
-      echo -e "${RED}下載 lua-resty-core 失敗${RESET}"; return 1;
-    }
-    cp -r resty_core_temp/lib/resty ./resty
-    rm -rf resty_core_temp
-
-    wget -O ./resty/lrucache.lua https://raw.githubusercontent.com/openresty/lua-resty-lrucache/master/lib/resty/lrucache.lua || {
-      echo -e "${RED}下載 lrucache 失敗${RESET}"; return 1;
-    }
     # download default
     rm -f $detect_conf_path/default.conf
     rm -f /etc/nginx/nginx.conf
     wget -O /etc/nginx/nginx.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/nginx.conf
-    sed -i 's|^#\s*pid\s\+/run/nginx.pid;|pid /run/nginx.pid;|' /etc/nginx/nginx.conf
     wget -O /etc/nginx/conf.d/default.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/default_system
-    id -u nginx &>/dev/null || adduser -D -H -s /sbin/nologin nginx
-    rc-service nginx restart
+    if [ $mode == openresty ]; then
+      id -u nginx &>/dev/null || adduser -D -H -s /sbin/nologin nginx
+    fi
+    restart_nginx_openresty
     ;;
   esac
+  read -p "aa" -n1
 }
 
 detect_conf_path() {
@@ -1738,116 +1765,102 @@ install_wp_plugin_with_search_or_url() {
   done
 }
 
-install_nginx(){
-  echo "未偵測到 Nginx 或 OpenResty，執行安裝..."
-  case "$system" in
-  1)
-    apt update
-    apt install -y curl gnupg2 ca-certificates lsb-release
-    local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
-    local codename=$(lsb_release -sc)
-    curl -s https://openresty.org/package/pubkey.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/openresty.gpg
-    if [[ $os == "debian" ]]; then
-      echo "deb http://openresty.org/package/debian $(lsb_release -sc) openresty" | tee /etc/apt/sources.list.d/openresty.list
-    elif [[ $os == "kali" ]]; then
-      codename="bookworm"
-      echo "deb http://openresty.org/package/debian $codename openresty" | tee /etc/apt/sources.list.d/openresty.list
-    elif [[ $os == "ubuntu" ]]; then
-      echo "deb http://openresty.org/package/ubuntu $(lsb_release -sc) openresty" | tee /etc/apt/sources.list.d/openresty.list
-    fi
-    apt update
-    apt install openresty -y
-    rm -rf /etc/nginx
-    ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
-    ln -sf /usr/local/openresty/nginx/conf /etc/nginx
-    mkdir -p /etc/nginx/conf.d
-    default
+install_web_server(){
+  local mode=$1
+  local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+  local codename=$(lsb_release -sc)
+  
+  if [ $mode == openresty ]; then
+    case "$system" in
+    1)
+      apt update
+      apt install -y curl gnupg2 ca-certificates lsb-release
+      curl -s https://openresty.org/package/pubkey.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/openresty.gpg
+      if [[ $os == "debian" ]]; then
+        echo "deb https://openresty.org/package/debian $codename openresty" | tee /etc/apt/sources.list.d/openresty.list
+      elif [[ $os == "kali" ]]; then
+        codename="bookworm"
+        echo "deb https://openresty.org/package/debian $codename openresty" | tee /etc/apt/sources.list.d/openresty.list
+      elif [[ $os == "ubuntu" ]]; then
+        echo "deb https://openresty.org/package/ubuntu $codename openresty" | tee /etc/apt/sources.list.d/openresty.list
+      fi
+      apt update
+      apt install openresty -y
+      rm -rf /etc/nginx
+      ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
+      ln -sf /usr/local/openresty/nginx/conf /etc/nginx
+      mkdir -p /etc/nginx/conf.d
+      systemctl enable openresty
     ;;
-  2)
-    yum update
-    yum install -y yum-utils
-    yum-config-manager --add-repo https://openresty.org/package/centos/openresty.repo
-    yum update
-    yum install -y openresty --nogpgcheck
-    rm -rf /etc/nginx
-    ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
-    ln -sf /usr/local/openresty/nginx/conf /etc/nginx
-    mkdir -p /etc/nginx/conf.d
-    default
-    ;;
-  3)
-    apk update
-    apk add build-base pcre-dev zlib-dev openssl-dev git cmake linux-headers perl luajit-dev libtool automake autoconf
-    wget https://nginx.org/download/nginx-1.27.5.tar.gz
-    tar -xzvf nginx-1.27.5.tar.gz
-    cd nginx-1.27.5
-    git clone --depth=1 -b OpenSSL_1_1_1u+quic https://github.com/quictls/openssl.git
-    git clone https://github.com/simpl/ngx_devel_kit.git
-    git clone https://github.com/openresty/lua-nginx-module.git
-    ./configure \
-      --prefix=/etc/nginx \
-      --sbin-path=/usr/sbin/nginx \
-      --conf-path=/etc/nginx/nginx.conf \
-      --with-http_v3_module \
-      --with-http_ssl_module \
-      --with-http_v2_module \
-      --with-http_gzip_static_module \
-      --with-http_realip_module \
-      --with-stream \
-      --with-http_stub_status_module \
-      --with-openssl=./openssl \
-      --with-cc-opt="-I./openssl/include -I/usr/include/luajit-2.1" \
-      --with-ld-opt="-L./openssl -lluajit-5.1" \
-      --add-module=./ngx_devel_kit \
-      --add-module=./lua-nginx-module
-      make
-      make install
-      cd ..
-      cat > /etc/init.d/nginx<<'EOF' 
-#!/sbin/openrc-run
-
-description="nginx web server"
-
-command="/usr/sbin/nginx"
-command_args="-c /etc/nginx/nginx.conf"
-pidfile="/run/nginx.pid"
-
-depend() {
-    need net
-    use dns logger
-    provide nginx
-}
-
-start() {
-    ebegin "Starting nginx"
-    start-stop-daemon --start --exec $command -- $command_args
-    eend $?
-}
-
-stop() {
-    ebegin "Stopping nginx"
-    start-stop-daemon --stop --pidfile $pidfile --retry TERM/30/KILL/5
-    eend $?
-}
-
-reload() {
-    ebegin "Reloading nginx configuration"
-    if [ -f "$pidfile" ]; then
-        kill -HUP $(cat $pidfile)
-        eend $?
-    else
-        eerror "PID file not found"
-        return 1
-    fi
-}
-EOF
-      # delete old 資料夾
-      rm -rf nginx-1.27.5 nginx-1.27.5.tar.gz
-      chmod +x /etc/init.d/nginx
-      rc-update add nginx default
-      default
+    2)
+      yum update
+      yum install -y yum-utils
+      yum-config-manager --add-repo https://openresty.org/package/centos/openresty.repo
+      yum update
+      yum install -y openresty --nogpgcheck
+      rm -rf /etc/nginx
+      ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
+      ln -sf /usr/local/openresty/nginx/conf /etc/nginx
+      mkdir -p /etc/nginx/conf.d
+      systemctl enable openresty
       ;;
-  esac
+    3)
+      apk update
+      apk add --no-cache pcre openssl curl gnupg
+      curl -O https://openresty.org/package/admin@openresty.com-5ea678a6.rsa.pub
+      mv admin@openresty.com-5ea678a6.rsa.pub /etc/apk/keys/
+      echo "https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main" \
+        | tee -a /etc/apk/repositories
+      apk update
+      apk add --no-cache openresty
+      ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
+      ln -sf /usr/local/openresty/nginx/conf /etc/nginx
+      mkdir -p /etc/nginx/conf.d
+      rc-update add openresty default
+      ;;
+    esac
+  elif [ $mode == nginx ]; then
+    case $system in
+    1)
+      apt update
+      apt install -y curl gnupg2 ca-certificates lsb-release
+      curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+      if [[ $os == "debian" ]]; then
+        echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/debian $codename nginx" | tee /etc/apt/sources.list.d/nginx.list
+      elif [[ $os == "ubuntu" ]]; then
+        echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/ubuntu $codename nginx" | tee /etc/apt/sources.list.d/nginx.list
+      elif [[ $os == "kali" ]]; then
+        echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/debian bookworm nginx" | tee /etc/apt/sources.list.d/nginx.list
+      fi
+      apt update
+      apt install nginx -y
+      systemctl enable nginx
+      ;;
+    2)
+      tee /etc/yum.repos.d/nginx.repo << 'EOF'
+[nginx-stable]
+name=nginx stable repo
+baseurl=https://nginx.org/packages/centos/$releasever/$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=https://nginx.org/keys/nginx_signing.key
+module_hotfixes=true
+EOF
+      yum install nginx -y
+      systemctl enable nginx
+      ;;
+    3)
+      wget -O /tmp/nginx_signing.rsa.pub https://nginx.org/keys/nginx_signing.rsa.pub
+      mv /tmp/nginx_signing.rsa.pub /etc/apk/keys/
+      echo "https://nginx.org/packages/alpine/v$(cat /etc/alpine-release | cut -d'.' -f1,2)/main" | tee -a /etc/apk/repositories
+      apk update
+      apk add nginx
+      rc-update add nginx default
+      ;;
+    esac
+    check_web_server
+    default $mode
+  fi
 }
 
 install_wpcli_if_needed() {
@@ -2125,7 +2138,7 @@ php_switch_version() {
       ;;
     3)
       rc-service php-fpm$shortold stop 2>/dev/null
-      rc-update del php-fpm$shortold default
+      rc-update del php-fpm$shortold 
       rc-service nginx stop 2>/dev/null
       ;;
   esac
@@ -2498,6 +2511,7 @@ restore_site_files() {
     echo -e "${RED}不支援的壓縮格式${RESET}"
     return 1
   fi
+  set_site_permissions $mode $dest_dir
 
   echo -e "${GREEN}[$mode] 檔案還原完成！${RESET}"
 
@@ -2589,57 +2603,91 @@ restore_site_db() {
   fi
 
   # 檢查 root 權限
-  local mysql_cmd="mysql -uroot"
-  if ! $mysql_cmd -e ";" &>/dev/null; then
-    if [[ -f /etc/mysql-pass.conf ]]; then
-      mysql_root_pass=$(cat /etc/mysql-pass.conf)
-      mysql_cmd="mysql -uroot -p$mysql_root_pass"
-    else
-      read -s -p "請輸入 MySQL root 密碼：" mysql_root_pass
+  # 全域變數 MYSQL_CMD（陣列）將會被設定為 mysql 指令
+  MYSQL_CMD=()
+
+  get_mysql_command() {
+    # 如果 MYSQL_CMD 已經設定，就直接返回
+    if [ ${#MYSQL_CMD[@]} -gt 0 ]; then
+      return 0
+    fi
+
+    local mysql_root_pw=""
+    local pass_file="/etc/mysql-pass.conf"
+
+    # 嘗試無密碼登入
+    if mysql -u root -e "SELECT 1;" &>/dev/null; then
+      MYSQL_CMD=("mysql" "-u" "root")
+      return 0
+    fi
+
+    # 嘗試讀取 /etc/mysql-pass.conf
+    if [ -f "$pass_file" ]; then
+      mysql_root_pw=$(< "$pass_file")
+      if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+        MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
+        return 0
+      fi
+    fi
+
+    # 不存在 conf 或無效，請使用者輸入
+    while true; do
+      read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
       echo
-      mysql_cmd="mysql -uroot -p$mysql_root_pass"
-    fi
-    if ! $mysql_cmd -e ";" &>/dev/null; then
-      echo -e "${RED}無法登入 MySQL${RESET}"
-      return 1
-    fi
-  fi
+      if [ -z "$mysql_root_pw" ]; then
+        echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
+        continue
+      fi
+
+      if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
+        echo -e "${GREEN}密碼正確，已成功登入 MySQL${RESET}" 
+        echo "$mysql_root_pw" > "$pass_file"
+        chmod 600 "$pass_file"
+        echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
+        MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
+        return 0
+      else
+        echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
+      fi
+    done
+  }
+  get_mysql_command
 
   echo "檢查資料庫是否存在：$db_name"
-  if ! $mysql_cmd -e "USE \`$db_name\`;" 2>/dev/null; then
+  if ! "${MYSQL_CMD[@]}" -e "USE \`$db_name\`;" 2>/dev/null; then
     echo "資料庫 $db_name 不存在，將自動建立..."
-    $mysql_cmd -e "CREATE DATABASE IF NOT EXISTS \`$db_name\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
   else
     echo "資料庫已存在，清空所有資料表..."
-    local tables=$($mysql_cmd -N -e "SHOW TABLES FROM \`$db_name\`;")
+    local tables=$("${MYSQL_CMD[@]}" -N -e "SHOW TABLES FROM \`$db_name\`;")
     for table in $tables; do
       echo "刪除表：$table"
-      $mysql_cmd -e "DROP TABLE \`$db_name\`.\`$table\`;"
+      "${MYSQL_CMD[@]}" -e "DROP TABLE \`$db_name\`.\`$table\`;"
     done
     echo -e "${GREEN}已清空資料表${RESET}"
   fi
 
   echo -e "${CYAN}匯入資料中...${RESET}"
-  $mysql_cmd "$db_name" < "$backup_file"
+  "${MYSQL_CMD[@]}" "$db_name" < "$backup_file"
 
   # 匯入後檢查
-  local tables_after=$($mysql_cmd -N -e "SHOW TABLES FROM \`$db_name\`;")
+  local tables_after=$("${MYSQL_CMD[@]}" -N -e "SHOW TABLES FROM \`$db_name\`;")
   if [[ -z "$tables_after" ]]; then
     echo -e "${RED}匯入後資料表為空，請檢查 SQL 檔或 DB 權限！${RESET}"
     return 1
   fi
 
   # 建立 user 並授權
-  local user_exists=$($mysql_cmd -N -e "SELECT User FROM mysql.user WHERE User='$db_user';")
+  local user_exists=$("${MYSQL_CMD[@]}" -N -e "SELECT User FROM mysql.user WHERE User='$db_user';")
   if [[ -z "$user_exists" ]]; then
     echo -e "${YELLOW}使用者 $db_user 不存在，將自動建立...${RESET}"
-    $mysql_cmd -e "CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass';"
+    "${MYSQL_CMD[@]}" -e "CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass';"
   fi
 
-  local grants=$($mysql_cmd -N -e "SHOW GRANTS FOR '$db_user'@'localhost';" | grep "\`$db_name\`")
+  local grants=$("${MYSQL_CMD[@]}" -N -e "SHOW GRANTS FOR '$db_user'@'localhost';" | grep "\`$db_name\`")
   if [[ -z "$grants" ]]; then
     echo -e "${YELLOW}使用者 $db_user 尚未擁有 $db_name 權限，將授權...${RESET}"
-    $mysql_cmd -e "GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; FLUSH PRIVILEGES;"
+    "${MYSQL_CMD[@]}" -e "GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; FLUSH PRIVILEGES;"
   fi
 
   # 如果是自動偵測的備份檔，還原後刪除
@@ -2648,7 +2696,37 @@ restore_site_db() {
     rm -f "$backup_file"
   fi
 
-  echo -e "${GREEN}✅ $type 資料庫 [$db_name] 還原完成${RESET}"
+  echo -e "${GREEN}$type 資料庫 [$db_name] 還原完成${RESET}"
+}
+
+set_site_permissions() {
+  local mode="$1"
+  local dest_dir="$2"
+
+  local ngx_user=$(get_nginx_run_user)
+
+  echo -e "${CYAN}設定檔案擁有者為：$owner${RESET}"
+  chown -R $ngx_user:$ngx_user "$dest_dir"
+
+  echo -e "${CYAN}套用預設檔案/資料夾權限...${RESET}"
+  find "$dest_dir" -type d -exec chmod 755 {} +
+  find "$dest_dir" -type f -exec chmod 644 {} +
+
+  case "$mode" in
+    wp)
+      mkdir -p "$dest_dir/wp-content/uploads" "$dest_dir/wp-content/cache"
+      chown -R $ngx_user:$ngx_user "$dest_dir/wp-content"
+      find "$dest_dir/wp-content" -type d -exec chmod 775 {} +
+      find "$dest_dir/wp-content" -type d -exec chmod g+s {} +
+      [ -f "$dest_dir/wp-config.php" ] && chmod 640 "$dest_dir/wp-config.php"
+      ;;
+    flarum)
+      mkdir -p "$dest_dir/storage" "$dest_dir/public/assets"
+      chown -R $ngx_user:$ngx_user "$dest_dir/storage" "$dest_dir/public/assets"
+      find "$dest_dir/storage" "$dest_dir/public/assets" -type d -exec chmod 775 {} +
+      find "$dest_dir/storage" "$dest_dir/public/assets" -type d -exec chmod g+s {} +
+      ;;
+  esac
 }
 
 
@@ -3363,14 +3441,15 @@ uninstall_nginx(){
     esac
     service openresty stop
     case $system in
-    1) apt remove openresty ;;
-    2) yum remove openresty ;;
+    1) apt purge -y openresty ;;
+    2) yum remove -y openresty ;;
     3) apk del openresty ;;
     esac
     pkill -f openresty
     pkill -f nginx
     unlink /etc/nginx
     unlink /usr/sbin/nginx
+    rm -rf /etc/nginx
   elif [ $nginx -eq 1 ]; then
     case $system in
     1|2)
@@ -3382,19 +3461,21 @@ uninstall_nginx(){
     esac
     service nginx stop
     case $system in
-    1) apt remove nginx ;;
-    2) yum remove nginx ;;
+    1) apt purge -y nginx* ;;
+    2) yum remove -y nginx ;;
     3)
       apk del nginx
       rm -rf /etc/init.d/nginx
     ;;
     esac
+    rm -rf /etc/nginx
     local nginx_path=$(command -v nginx)
     if [ -n $nginx_path ]; then
       rm -rf $nginx_path
     fi
     pkill -f nginx
   fi
+  exit 0
 }
 
 
@@ -3959,7 +4040,7 @@ show_menu(){
   echo "-------------------"
   echo "站點管理器"
   echo ""
-  echo -e "${YELLOW}i. 安裝或重裝 Nginx / OpenResty          r. 解除安裝 Nginx / OpenResty${RESET}"
+  echo -e "${YELLOW}i. 安裝 Nginx / OpenResty          r. 解除安裝 Nginx / OpenResty${RESET}"
   echo ""
   echo "1. 新增站點           2. 刪除站點"
   echo ""
@@ -4114,7 +4195,7 @@ while true; do
       ;;
     9)
       if ! command -v d >/dev/null 2>&1; then
-        bash <(curl -sL https://raw.githubusercontent.com/gebu8f8/docker_sh/refs/heads/main/install.sh)
+        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/docker/install.sh)
       else
         d
       fi
