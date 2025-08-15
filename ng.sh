@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.9.0"
+version="6.9.1"
 
 
 # 顏色定義
@@ -945,7 +945,7 @@ change_wp_admin_username() {
 
   # 確認 WordPress 路徑
   if [ ! -f "$site_path/wp-config.php" ]; then
-    echo "❌ 找不到 WordPress 安裝路徑：$site_path"
+    echo -e "${RED}找不到 WordPress 安裝路徑：$site_path${RESET}"
     return 1
   fi
 
@@ -953,7 +953,7 @@ change_wp_admin_username() {
   mapfile -t admins < <(wp --allow-root --path="$site_path" user list --role=administrator --field=user_login)
 
   if [ ${#admins[@]} -eq 0 ]; then
-    echo "❌ 沒有找到管理員用戶"
+    echo -e "${RED}沒有找到管理員用戶${RESET}"
     return 1
   fi
 
@@ -2782,12 +2782,18 @@ setup_site() {
             -e "s|main|$escaped_cert|g" \
             "$conf_file"
           setup_site_http2 "$domain"
-          if nginx -t; then
-            restart_nginx_openresty
-          else
-            echo "nginx 測試失敗，請檢查配置"
-            return 1
+          if [ $openresty -eq 1 ]; then
+            openresty -t || {
+              echo "openresty 測試失敗，請檢查配置"
+              return 1
+            }
+          elif [ $nginx -eq 1 ]; then
+            nginx -t || {
+              echo "nginx 測試失敗，請檢查配置"
+              return 1
+            }
           fi
+          restart_nginx_openresty
           ;;
         proxy)
           local target_url=$3
@@ -2799,12 +2805,18 @@ setup_site() {
             -e "s|main|$escaped_cert|g" \
             "$conf_file"
           setup_site_http2 "$domain"
-          if nginx -t; then
-            restart_nginx_openresty
-          else
-            echo "nginx測試失敗"
-            return 1
+          if [ $openresty -eq 1 ]; then
+            openresty -t || {
+              echo "openresty 測試失敗，請檢查配置"
+              return 1
+            }
+          elif [ $nginx -eq 1 ]; then
+            nginx -t || {
+              echo "nginx 測試失敗，請檢查配置"
+              return 1
+            }
           fi
+          restart_nginx_openresty
           ;;
         *)
           echo "不支援的類型: $type"; return 1;;
