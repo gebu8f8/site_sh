@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.9.1"
+version="6.9.2"
 
 
 # 顏色定義
@@ -950,7 +950,7 @@ change_wp_admin_username() {
   fi
 
   # 取得管理員用戶名列表
-  mapfile -t admins < <(wp --allow-root --path="$site_path" user list --role=administrator --field=user_login)
+  mapfile -t admins < <(wp --skip-plugins --skip-themes --allow-root --path="$site_path" user list --role=administrator --field=user_login)
 
   if [ ${#admins[@]} -eq 0 ]; then
     echo -e "${RED}沒有找到管理員用戶${RESET}"
@@ -980,7 +980,7 @@ change_wp_admin_username() {
   fi
 
   # 確認新用戶名是否已存在
-  if wp --allow-root --path="$site_path" user get "$new_username" >/dev/null 2>&1; then
+  if wp --skip-plugins --skip-themes --allow-root --path="$site_path" user get "$new_username" >/dev/null 2>&1; then
     echo -e "${RED} 新用戶名已存在，請換一個${RESET}"
     return 1
   fi
@@ -1003,7 +1003,7 @@ change_wp_admin_password() {
   fi
 
   # 取得管理員用戶名列表
-  mapfile -t admins < <(wp --allow-root --path="$site_path" user list --role=administrator --field=user_login)
+  mapfile -t admins < <(wp --skip-plugins --skip-themes --allow-root --path="$site_path" user list --role=administrator --field=user_login)
 
   if [ ${#admins[@]} -eq 0 ]; then
     echo -e "${RED}沒有找到管理員用戶${RESET}"
@@ -1042,7 +1042,7 @@ change_wp_admin_password() {
   fi
 
   # 修改密碼
-  wp --allow-root --path="$site_path" user update "$selected_admin" --user_pass="$new_password" --skip-email
+  wp --skip-plugins --skip-themes --allow-root --path="$site_path" user update "$selected_admin" --user_pass="$new_password" --skip-email
 
   if [ $? -eq 0 ]; then
     echo -e "${GREEN}管理員 '$selected_admin' 的密碼已更新成功${RESET}"
@@ -1230,7 +1230,7 @@ deploy_or_remove_theme() {
 
   local site_path="/var/www/$domain"
   local wp_theme_dir="$site_path/wp-content/themes"
-  local wp_cli="wp --allow-root"
+  local wp_cli="wp --skip-plugins --skip-themes --allow-root"
 
   # 確保 wp-cli 存在
   if ! command -v wp >/dev/null 2>&1; then
@@ -1353,6 +1353,9 @@ deploy_or_remove_theme() {
         name=$(echo "$theme" | cut -d'|' -f1)
         status=$(echo "$theme" | cut -d'|' -f2)
         slug=$(echo "$theme" | cut -d'|' -f3)
+        if [ "$status" = "dropin" ]; then
+          continue
+        fi
 
         options+=("$name [$status]")
         slugs+=("$slug")
@@ -1714,7 +1717,7 @@ install_wp_plugin_with_search_or_url() {
     plugin_slug=$(ls -1 "$plugin_dir" | head -n 1)
     if [ -n "$plugin_slug" ]; then
       echo -e "${GREEN}正在嘗試啟用插件...${RESET}"
-      wp --allow-root --path="$site_path" plugin activate "$plugin_slug" 2>/dev/null \
+      wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin activate "$plugin_slug" 2>/dev/null \
          && echo -e "${GREEN}已啟用插件：$plugin_slug${RESET}" \
          || echo -e "${YELLOW}無法自動啟用，請手動啟用插件${RESET}"
     else
@@ -1729,7 +1732,7 @@ install_wp_plugin_with_search_or_url() {
   echo "正在搜尋包含 \"$input\" 的插件..."
 
   mapfile -t plugins < <(
-    wp --allow-root --path="$site_path" plugin search "$input" --per-page=10 --format=json | jq -r '.[] | "\(.name)|\(.slug)"'
+    wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin search "$input" --per-page=10 --format=json | jq -r '.[] | "\(.name)|\(.slug)"'
   )
 
   if [ ${#plugins[@]} -eq 0 ]; then
@@ -1757,7 +1760,7 @@ install_wp_plugin_with_search_or_url() {
       idx=$((REPLY - 1))
       slug="${slugs[$idx]}"
       echo -e "${CYAN}開始安裝插件：$slug${RESET}"
-      wp --allow-root --path="$site_path" plugin install "$slug" --activate
+      wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin install "$slug" --activate
       return
     else
       echo -e "${YELLOW}無效的選項，請重新選擇${RESET}"
@@ -2378,7 +2381,7 @@ remove_wp_plugin_with_menu() {
 
   local options=()
   for folder in "${plugin_folders[@]}"; do
-    status=$(wp --allow-root --path="$site_path" plugin get "$folder" --field=status 2>/dev/null)
+    status=$(wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin get "$folder" --field=status 2>/dev/null)
     if [ -n "$status" ]; then
       options+=("$folder [$status]")
     else
@@ -2391,8 +2394,8 @@ remove_wp_plugin_with_menu() {
     if [ -n "$opt" ]; then
       slug=$(echo "$opt" | awk '{print $1}')
       echo -e "${CYAN}正在移除插件：$slug${RESET}"
-      wp --allow-root --path="$site_path" plugin deactivate "$slug"
-      wp --allow-root --path="$site_path" plugin delete "$slug"
+      wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin deactivate "$slug"
+      wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin delete "$slug"
       echo -e "${GREEN}插件已刪除：$slug${RESET}"
       return
     else
@@ -2448,7 +2451,7 @@ remove_site_backup_cron() {
 reset_wp_site() {
   local domain="$1"
   local path="/var/www/$domain"
-  local wp_cli="wp --allow-root"
+  local wp_cli="wp --skip-plugins --skip-themes --allow-root"
 
   # 檢查該路徑是否是 WordPress
   if [ ! -f "$path/wp-config.php" ]; then
