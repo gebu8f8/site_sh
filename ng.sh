@@ -6,13 +6,21 @@ if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     exec sudo "$0" "$@"
   else
-    echo "無sudo指令"
-    exit 1
+    if command -v apt >/dev/null 2>&1; then
+      apt install sudo -y
+    elif command -v yum >/dev/null 2>&1; then
+      yum install sudo -y
+    elif command -v apk >/dev/null 2>&1; then
+      apk add sudo
+    else
+      echo "無sudo指令"
+      exit 1
+    fi
   fi
 fi
 
 # 版本
-version="6.9.4"
+version="6.9.5"
 
 
 # 顏色定義
@@ -394,7 +402,7 @@ check_cert() {
   local level=${#domain_parts[@]}
 
   if [ "$level" -gt 6 ]; then
-    echo "網域層級過多（$level），請檢查輸入是否正確。"
+    echo "網域層級過多（$level），請檢查輸入是否正確。" >&2
     return 1
   fi
 
@@ -416,7 +424,7 @@ check_cert() {
     fi
   done
 
-  echo -e "${YELLOW}未找到包含 $domain 的有效憑證${RESET}"
+  echo -e "${YELLOW}未找到包含 $domain 的有效憑證${RESET}" >&2
   return 1
 }
 
@@ -987,7 +995,7 @@ change_wp_admin_username() {
 
   # 用 SQL 方式修改用戶名（因為 wp-cli 沒有直接修改用戶名指令）
   local sql="UPDATE wp_users SET user_login='${new_username}' WHERE user_login='${selected_admin}';"
-  wp --allow-root --path="$site_path" db query "$sql"
+  wp --skip-plugins --skip-themes --allow-root --path="$site_path" db query "$sql"
 
   echo -e "${GREEN}管理員使用者名稱已從 '$selected_admin' 修改為 '$new_username'${RESET}"
 }
@@ -1084,26 +1092,25 @@ default(){
   1|2)
     if [ mode == openresty ]; then
       rm -f /etc/nginx/nginx.conf
-      wget -O /etc/nginx/nginx.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/nginx.conf
+      wget -O /etc/nginx/nginx.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
       id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
     fi
     rm -f $detect_conf_path/default.conf $detect_conf_path/default
-    wget -O /etc/nginx/conf.d/default.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/default_system
+    wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     restart_nginx_openresty
     ;;
   3)
-    # download default
     if [ $mode == openresty ]; then
       id -u nginx &>/dev/null || adduser -D -H -s /sbin/nologin nginx
     fi
+    # download default
     rm -f $detect_conf_path/default.conf
     rm -f /etc/nginx/nginx.conf
-    wget -O /etc/nginx/nginx.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/nginx.conf
-    wget -O /etc/nginx/conf.d/default.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/default_system
+    wget -O /etc/nginx/nginx.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
+    wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     restart_nginx_openresty
     ;;
   esac
-  read -p "aa" -n1
 }
 
 detect_conf_path() {
@@ -1353,9 +1360,6 @@ deploy_or_remove_theme() {
         name=$(echo "$theme" | cut -d'|' -f1)
         status=$(echo "$theme" | cut -d'|' -f2)
         slug=$(echo "$theme" | cut -d'|' -f3)
-        if [ "$status" = "dropin" ]; then
-          continue
-        fi
 
         options+=("$name [$status]")
         slugs+=("$slug")
@@ -1732,7 +1736,7 @@ install_wp_plugin_with_search_or_url() {
   echo "正在搜尋包含 \"$input\" 的插件..."
 
   mapfile -t plugins < <(
-    wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin search "$input" --per-page=10 --format=json | jq -r '.[] | "\(.name)|\(.slug)"'
+    wp --allow-root --path="$site_path" plugin search "$input" --per-page=10 --format=json | jq -r '.[] | "\(.name)|\(.slug)"'
   )
 
   if [ ${#plugins[@]} -eq 0 ]; then
@@ -1760,7 +1764,7 @@ install_wp_plugin_with_search_or_url() {
       idx=$((REPLY - 1))
       slug="${slugs[$idx]}"
       echo -e "${CYAN}開始安裝插件：$slug${RESET}"
-      wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin install "$slug" --activate
+      wp --allow-root --path="$site_path" plugin install "$slug" --activate
       return
     else
       echo -e "${YELLOW}無效的選項，請重新選擇${RESET}"
@@ -2387,6 +2391,9 @@ remove_wp_plugin_with_menu() {
     else
       options+=("$folder [unknown]")
     fi
+    if [ "$status" = "dropin" ]; then
+      continue
+    fi
   done
 
   echo "請選擇要移除的插件："
@@ -2597,108 +2604,14 @@ restore_site_db() {
     return 1
   fi
 
-  if [[ -z "$backup_file" ]]; then
-    read -p "請輸入備份檔路徑 (.sql)：" backup_file
-    if [[ ! -f "$backup_file" ]]; then
-      echo -e "${RED}檔案不存在：$backup_file${RESET}"
+  if [[ -z "$backup_path" ]]; then
+    read -p "請輸入備份文件夾路徑 ：" backup_path
+    if [[ ! -f "$backup_path" ]]; then
+      echo -e "${RED}文件夾不存在：$backup_path${RESET}"
       return 1
     fi
   fi
-
-  # 檢查 root 權限
-  # 全域變數 MYSQL_CMD（陣列）將會被設定為 mysql 指令
-  MYSQL_CMD=()
-
-  get_mysql_command() {
-    # 如果 MYSQL_CMD 已經設定，就直接返回
-    if [ ${#MYSQL_CMD[@]} -gt 0 ]; then
-      return 0
-    fi
-
-    local mysql_root_pw=""
-    local pass_file="/etc/mysql-pass.conf"
-
-    # 嘗試無密碼登入
-    if mysql -u root -e "SELECT 1;" &>/dev/null; then
-      MYSQL_CMD=("mysql" "-u" "root")
-      return 0
-    fi
-
-    # 嘗試讀取 /etc/mysql-pass.conf
-    if [ -f "$pass_file" ]; then
-      mysql_root_pw=$(< "$pass_file")
-      if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-        MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
-        return 0
-      fi
-    fi
-
-    # 不存在 conf 或無效，請使用者輸入
-    while true; do
-      read -s -p "請輸入 MySQL root 密碼：" mysql_root_pw
-      echo
-      if [ -z "$mysql_root_pw" ]; then
-        echo -e "${YELLOW}密碼不能為空，請再試一次。${RESET}"
-        continue
-      fi
-
-      if mysql -u root -p"$mysql_root_pw" -e "SELECT 1;" &>/dev/null; then
-        echo -e "${GREEN}密碼正確，已成功登入 MySQL${RESET}" 
-        echo "$mysql_root_pw" > "$pass_file"
-        chmod 600 "$pass_file"
-        echo -e "${GREEN}已將 root 密碼寫入 $pass_file (權限 600)${RESET}"
-        MYSQL_CMD=("mysql" "-u" "root" "-p$mysql_root_pw")
-        return 0
-      else
-        echo -e "${RED}密碼錯誤，請再試一次。${RESET}"
-      fi
-    done
-  }
-  get_mysql_command
-
-  echo "檢查資料庫是否存在：$db_name"
-  if ! "${MYSQL_CMD[@]}" -e "USE \`$db_name\`;" 2>/dev/null; then
-    echo "資料庫 $db_name 不存在，將自動建立..."
-    "${MYSQL_CMD[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$db_name\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  else
-    echo "資料庫已存在，清空所有資料表..."
-    local tables=$("${MYSQL_CMD[@]}" -N -e "SHOW TABLES FROM \`$db_name\`;")
-    for table in $tables; do
-      echo "刪除表：$table"
-      "${MYSQL_CMD[@]}" -e "DROP TABLE \`$db_name\`.\`$table\`;"
-    done
-    echo -e "${GREEN}已清空資料表${RESET}"
-  fi
-
-  echo -e "${CYAN}匯入資料中...${RESET}"
-  "${MYSQL_CMD[@]}" "$db_name" < "$backup_file"
-
-  # 匯入後檢查
-  local tables_after=$("${MYSQL_CMD[@]}" -N -e "SHOW TABLES FROM \`$db_name\`;")
-  if [[ -z "$tables_after" ]]; then
-    echo -e "${RED}匯入後資料表為空，請檢查 SQL 檔或 DB 權限！${RESET}"
-    return 1
-  fi
-
-  # 建立 user 並授權
-  local user_exists=$("${MYSQL_CMD[@]}" -N -e "SELECT User FROM mysql.user WHERE User='$db_user';")
-  if [[ -z "$user_exists" ]]; then
-    echo -e "${YELLOW}使用者 $db_user 不存在，將自動建立...${RESET}"
-    "${MYSQL_CMD[@]}" -e "CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass';"
-  fi
-
-  local grants=$("${MYSQL_CMD[@]}" -N -e "SHOW GRANTS FOR '$db_user'@'localhost';" | grep "\`$db_name\`")
-  if [[ -z "$grants" ]]; then
-    echo -e "${YELLOW}使用者 $db_user 尚未擁有 $db_name 權限，將授權...${RESET}"
-    "${MYSQL_CMD[@]}" -e "GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'localhost' IDENTIFIED BY '$db_pass'; FLUSH PRIVILEGES;"
-  fi
-
-  # 如果是自動偵測的備份檔，還原後刪除
-  if [[ "$backup_file" == "$site_path/"*.sql ]]; then
-    echo "刪除已還原的備份檔: $backup_file"
-    rm -f "$backup_file"
-  fi
-
+  dba mysql import "$backup_path" $db_name $db_user $db_pass
   echo -e "${GREEN}$type 資料庫 [$db_name] 還原完成${RESET}"
 }
 
@@ -2779,7 +2692,7 @@ setup_site() {
     1|2|3)
       case $type in
         html|php|www|flarum|phpmyadmin)
-          local conf_url="https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/domain_${type}.conf"
+          local conf_url="https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_${type}.conf"
           wget -O "$conf_file" "$conf_url"
           sed -i -e "s|domain|$domain|g" \
             -e "s|main|$escaped_cert|g" \
@@ -2802,7 +2715,7 @@ setup_site() {
           local target_url=$3
           local target_protocol=$4
           local target_port=$5
-          wget -O "$conf_file" https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/domain_proxy.conf
+          wget -O "$conf_file" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_proxy.conf
           sed -i "s|proxy_pass host:port;|proxy_pass $target_protocol://$target_url:$target_port;|g" "$conf_file"
           sed -i -e "s|domain|$domain|g" \
             -e "s|main|$escaped_cert|g" \
@@ -2925,6 +2838,7 @@ EOF
     echo -e "[$ca_name]\nemail=$email\n" >> /ssl_ca/.ssl_ca_emails
   fi
 }
+
 show_cert_status() {
   check_web_environment
   if [[ $use_my_app != true ]]; then
@@ -3033,7 +2947,6 @@ show_cert_status() {
       "$nginx_domain" "$end_date" "$matched_cert" "$status" "$note"
   done
 }
-
 
 
 show_httpguard_status(){
@@ -3410,7 +3323,7 @@ update_certbot(){
   esac
 }
 update_script() {
-  local download_url="https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/ng.sh"
+  local download_url="https://gitlab.com/gebu8f/sh/-/raw/main/nginx/ng.sh"
   local temp_path="/tmp/ng.sh"
   local current_script="/usr/local/bin/site"
   local current_path="$0"
@@ -3691,46 +3604,26 @@ menu_del_sites(){
   rm -rf "$conf_file"
   rm -rf "/var/www/$domain"
 
-  # MySQL root 登入邏輯
-  if command -v mysql >/dev/null 2>&1; then
-    mysql_cmd="mysql -uroot"
-    if ! $mysql_cmd -e ";" &>/dev/null; then
-      if [ -f /etc/mysql-pass.conf ]; then
-        mysql_root_pass=$(cat /etc/mysql-pass.conf)
-        mysql_cmd="mysql -uroot -p$mysql_root_pass"
-      else
-        read -s -p "請輸入 MySQL root 密碼：" mysql_root_pass
-        echo
-        mysql_cmd="mysql -uroot -p$mysql_root_pass"
-      fi
-        if ! $mysql_cmd -e ";" &>/dev/null; then
-        echo "MySQL 密碼錯誤，無法刪除資料庫與使用者。"
-        return 1
-      fi
-    fi
-  fi
-
   # 刪除資料庫（依網站類型判斷）
   if [ "$is_wp_site" = true ]; then
     db_name="wp_${domain//./_}"
-    db_user="${db_name}_user"
     echo "正在刪除 WordPress 資料庫與使用者..."
   elif [ "$is_flarum_site" = true ]; then
     db_name="flarum_${domain//./_}"
-    db_user="${db_name}_user"
     echo "正在刪除 Flarum 資料庫與使用者..."
   fi
 
   if [ "$is_wp_site" = true ] || [ "$is_flarum_site" = true ]; then
-    $mysql_cmd -e "DROP DATABASE IF EXISTS $db_name;"
-    $mysql_cmd -e "DROP USER IF EXISTS '$db_user'@'localhost';"
-    $mysql_cmd -e "FLUSH PRIVILEGES;"
+    if ! command -v dba >/dev/null 2>&1; then
+      bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
+    fi
+    dba mysql del $db_name --force
   fi
 
   # 重啟 nginx
   restart_nginx_openresty
 
-  echo "已刪除 $domain 站點${is_wp_site:+（含 WordPress 資料庫）}${is_flarum_site:+（含 Flarum 資料庫）}。"
+  echo "已刪除 $domain 站點。"
 }
 
 menu_ssl_apply() {
@@ -3763,8 +3656,8 @@ menu_ssl_revoke() {
   fi
 
   # 先取得 cert_info 與 cert_path
-  local cert_info=$(check_cert "$domain")
-  if [ $? -ne 0 ]; then
+  local cert_info
+  if ! cert_info=$(check_cert "$domain"); then
     echo "憑證檢查失敗: $cert_info"
     return 1
   fi
