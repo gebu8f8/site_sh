@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.9.2"
+version="6.9.3"
 
 
 # 顏色定義
@@ -1082,24 +1082,24 @@ default(){
   generate_ssl_cert
   case "$system" in
   1|2)
-    rm -f $detect_conf_path/default.conf $detect_conf_path/default
-    wget -O /etc/nginx/conf.d/default.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/default_system
     if [ mode == openresty ]; then
       rm -f /etc/nginx/nginx.conf
       wget -O /etc/nginx/nginx.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/nginx.conf
       id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
     fi
+    rm -f $detect_conf_path/default.conf $detect_conf_path/default
+    wget -O /etc/nginx/conf.d/default.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/default_system
     restart_nginx_openresty
     ;;
   3)
     # download default
+    if [ $mode == openresty ]; then
+      id -u nginx &>/dev/null || adduser -D -H -s /sbin/nologin nginx
+    fi
     rm -f $detect_conf_path/default.conf
     rm -f /etc/nginx/nginx.conf
     wget -O /etc/nginx/nginx.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/nginx.conf
     wget -O /etc/nginx/conf.d/default.conf https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/default_system
-    if [ $mode == openresty ]; then
-      id -u nginx &>/dev/null || adduser -D -H -s /sbin/nologin nginx
-    fi
     restart_nginx_openresty
     ;;
   esac
@@ -1408,7 +1408,7 @@ flarum_setup() {
     bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
   fi
   if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then
-    dba mysql install
+    dba mysql install true
   fi
 
   if ! command -v composer &>/dev/null; then
@@ -3514,7 +3514,7 @@ wordpress_site() {
     bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
   fi
   if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then
-    dba mysql install
+    dba mysql install true
   fi
   read -p "請輸入您的 WordPress 網址（例如 wp.example.com）：" domain
 
