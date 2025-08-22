@@ -12,7 +12,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.9.3"
+version="6.9.4"
 
 
 # 顏色定義
@@ -2930,92 +2930,108 @@ show_cert_status() {
   if [[ $use_my_app != true ]]; then
     echo -e "===== Nginx 站點憑證狀態 ====="
     echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
-  else
-    echo -e "===== Nginx 站點憑證狀態 ====="
+    return
+  fi
 
-    # 定義表頭文字
-    local col1="域名"
-    local col2="到期日"
-    local col3="憑證資料夾"
-    local col4="狀態"
-    local col5="備註"
+  echo -e "===== Nginx 站點憑證狀態 ====="
 
-    # 列印表頭，並補足空白對齊
-    printf "%-32s %-26s %-24s %-16s %s\n" \
-      "$col1$(printf '%*s' $((32 - ${#col1} * 2)) '')" \
-      "$col2$(printf '%*s' $((26 - ${#col2} * 2)) '')" \
-      "$col3$(printf '%*s' $((24 - ${#col3} * 2)) '')" \
-      "$col4$(printf '%*s' $((16 - ${#col4} * 2)) '')" \
-      "$col5"
+  # 定義表頭文字
+  local col1="域名"
+  local col2="到期日"
+  local col3="憑證資料夾"
+  local col4="狀態"
+  local col5="備註"
 
-    printf "%s\n" "----------------------------------------------------------------------------------------------------------------------------------"
+  # 列印表頭
+  printf "%-32s %-26s %-24s %-16s %s\n" "$col1" "$col2" "$col3" "$col4" "$col5"
+  printf "%s\n" "----------------------------------------------------------------------------------------------------------------------------------"
 
-    local CERT_PATH="/etc/letsencrypt/live"
-    local nginx_conf_paths
-    nginx_conf_paths=$(detect_conf_path)
+  local CERT_PATH="/etc/letsencrypt/live"
+  
+  # --- 效能改善核心：建立憑證資訊快取 ---
+  # 需要 bash 4.0+
+  if (( BASH_VERSINFO[0] < 4 )); then
+      echo "錯誤：此腳本需要 Bash 4.0 或更高版本才能使用關聯陣列。" >&2
+      return 1
+  fi
 
-    local nginx_domains
-    nginx_domains=$(grep -rhoE 'server_name\s+[^;]+' "$nginx_conf_paths" 2>/dev/null | \
-      sed -E 's/server_name\s+//' | tr ' ' '\n' | grep -E '^[a-zA-Z0-9.-]+$' | sort -u)
+  declare -A san_to_cert                 # 儲存 SAN -> 憑證資料夾名稱 的對應
+  declare -A wildcard_certs              # 儲存 泛域名基礎域 -> 憑證資料夾名稱 的對應
+  declare -A cert_expiry_dates           # 儲存 憑證資料夾名稱 -> 到期日 的對應
+  
+  # 遍歷一次所有憑證，建立快取
+  for cert_dir in "$CERT_PATH"/*; do
+    [[ -d "$cert_dir" ]] || continue
+    local cert_file="$cert_dir/cert.pem"
+    [[ -f "$cert_file" ]] || continue
 
-    for nginx_domain in $nginx_domains; do
-      local matched_cert="-"
-      local end_date="無憑證"
-      local status="未使用/錯誤"
-      local note=""
+    local cert_name
+    cert_name=$(basename "$cert_dir")
 
-      local exact_match_cert=""
-      local exact_match_date=""
-      local wildcard_match_cert=""
-      local wildcard_match_date=""
+    # 一次性執行 openssl 取得所有需要的資訊
+    local cert_info
+    cert_info=$(openssl x509 -in "$cert_file" -noout -text -enddate 2>/dev/null)
 
-      for cert_dir in "$CERT_PATH"/*; do
-        [[ -d "$cert_dir" ]] || continue
-        local cert_file="$cert_dir/cert.pem"
-        [[ -f "$cert_file" ]] || continue
+    # 如果 openssl 執行失敗則跳過
+    if [[ -z "$cert_info" ]]; then continue; fi
 
-        local san_list
-        san_list=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | \
-          awk '/X509v3 Subject Alternative Name/ {getline; gsub("DNS:", ""); gsub(", ", "\n"); print}')
+    # 提取到期日並存入快取
+    local end_date
+    end_date=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
+    cert_expiry_dates["$cert_name"]="$end_date"
 
-        for san in $san_list; do
-          if [[ "$san" == "$nginx_domain" ]]; then
-            exact_match_cert=$(basename "$cert_dir")
-            exact_match_date=$(openssl x509 -enddate -noout -in "$cert_file" | cut -d= -f2)
-            break 2
-          elif [[ "$san" == \*.* ]]; then
-            local base_domain="${san#*.}"
-            if [[ "$nginx_domain" == *".${base_domain}" ]]; then
-              if [[ -z "$wildcard_match_cert" ]]; then
-                wildcard_match_cert=$(basename "$cert_dir")
-                wildcard_match_date=$(openssl x509 -enddate -noout -in "$cert_file" | cut -d= -f2)
-              fi
-            fi
-          fi
-        done
-      done
+    # 提取 SAN 列表並存入快取
+    local san_list
+    san_list=$(echo "$cert_info" | awk '/X509v3 Subject Alternative Name/ {getline; gsub("DNS:", ""); gsub(", ", "\n"); print}')
+    
+    for san in $san_list; do
+      if [[ "$san" == \*.* ]]; then
+        local base_domain="${san#*.}"
+        wildcard_certs["$base_domain"]="$cert_name"
+      else
+        san_to_cert["$san"]="$cert_name"
+      fi
+    done
+  done
+  # --- 快取建立完成 ---
 
-      if [[ -n "$exact_match_cert" ]]; then
-        matched_cert="$exact_match_cert"
-        end_date="$exact_match_date"
-        status="是"
-      elif [[ -n "$wildcard_match_cert" ]]; then
-        matched_cert="$wildcard_match_cert"
-        end_date="$wildcard_match_date"
+  local nginx_conf_paths
+  nginx_conf_paths=$(detect_conf_path)
+
+  local nginx_domains
+  nginx_domains=$(grep -rhoE 'server_name\s+[^;]+' "$nginx_conf_paths" 2>/dev/null | \
+    sed -E 's/server_name\s+//' | tr ' ' '\n' | grep -E '^[a-zA-Z0-9.-]+$' | sort -u)
+
+  # 遍歷 Nginx 域名，從快取中查詢資訊
+  for nginx_domain in $nginx_domains; do
+    local matched_cert="-"
+    local end_date="無憑證"
+    local status="未使用/錯誤"
+    local note=""
+
+    # 1. 優先查詢精確匹配
+    if [[ -n "${san_to_cert[$nginx_domain]}" ]]; then
+      matched_cert="${san_to_cert[$nginx_domain]}"
+      end_date="${cert_expiry_dates[$matched_cert]}"
+      status="是"
+    else
+      # 2. 如果沒有精確匹配，再查詢泛域名匹配
+      local base_domain="${nginx_domain#*.}"
+      # 確保這是一個子域名 (e.g., a.b.c -> b.c) 而不是頂級域名 (e.g., b.c -> b.c)
+      if [[ "$base_domain" != "$nginx_domain" && -n "${wildcard_certs[$base_domain]}" ]]; then
+        matched_cert="${wildcard_certs[$base_domain]}"
+        end_date="${cert_expiry_dates[$matched_cert]}"
         status="泛域名命中"
       fi
+    fi
 
-      if [[ -d "$CERT_PATH/$matched_cert" ]] && [[ -f "$CERT_PATH/$matched_cert/cf_cert_id.txt" ]]; then
-        note="CF Origin"
-      fi
+    if [[ "$matched_cert" != "-" && -f "$CERT_PATH/$matched_cert/cf_cert_id.txt" ]]; then
+      note="CF Origin"
+    fi
 
-      # 對「狀態」欄固定寬度
-      status=$(printf "%-16s" "$status")
-
-      printf "%-32s %-26s %-24s %-16s %s\n" \
-        "$nginx_domain" "$end_date" "$matched_cert" "$status" "$note"
-    done
-  fi
+    printf "%-32s %-26s %-24s %-16s %s\n" \
+      "$nginx_domain" "$end_date" "$matched_cert" "$status" "$note"
+  done
 }
 
 
