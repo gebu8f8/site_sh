@@ -101,7 +101,7 @@ jobs:
             --arg system_msg "請用繁體中文，根據以下 diff 寫出 changelog 條列，不要開場白、不要說明文字、也不要提到版本更新，也不要提到 diff，僅條列變更項目，簡短扼要。條列時請使用 - 作為項目前綴符號。" \
             --arg user_msg "$diff_text" \
             '{
-              model: "deepseek/deepseek-chat-v3-0324:free",
+              model: "deepseek/DeepSeek-V3-0324",
               messages: [
                 {"role": "system", "content": $system_msg},
                 {"role": "user", "content": $user_msg}
@@ -109,7 +109,7 @@ jobs:
             }')
 
           curl -s -X POST $AI_API_URL \
-            -H "Authorization: Bearer $AI_API_KEY" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$json_payload" > response.json
 
@@ -118,6 +118,8 @@ jobs:
           echo "summary<<EOF" >> $GITHUB_ENV
           echo "$summary" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Show Release Note
         if: env.changed_ngsh == 'true' && env.skip_whole_workflow != 'true'
