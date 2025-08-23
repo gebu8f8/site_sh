@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.9.5"
+version="6.9.6"
 
 
 # 顏色定義
@@ -2849,16 +2849,36 @@ show_cert_status() {
 
   echo -e "===== Nginx 站點憑證狀態 ====="
 
-  # 定義表頭文字
-  local col1="域名"
-  local col2="到期日"
-  local col3="憑證資料夾"
-  local col4="狀態"
-  local col5="備註"
+  # 計算字符串的顯示寬度（中文字符=2，英文字符=1）
+  display_width() {
+    local str="$1"
+    local width=0
+    local i=0
+    while [ $i -lt ${#str} ]; do
+      local char="${str:$i:1}"
+      # 檢查是否為多字節字符（簡單判斷）
+      if [ $(printf "%d" "'$char") -gt 127 ] 2>/dev/null; then
+        width=$((width + 2))
+      else
+        width=$((width + 1))
+      fi
+      i=$((i + 1))
+    done
+    echo $width
+  }
 
-  # 列印表頭
-  printf "%-32s %-26s %-24s %-16s %s\n" "$col1" "$col2" "$col3" "$col4" "$col5"
-  printf "%s\n" "----------------------------------------------------------------------------------------------------------------------------------"
+  # 左對齊填充函數
+  pad_left() {
+    local text="$1"
+    local width="$2"
+    local current_width=$(display_width "$text")
+    local spaces=$((width - current_width))
+    if [ $spaces -gt 0 ]; then
+      printf "%s%*s" "$text" $spaces ""
+    else
+      printf "%-*.*s" $width $width "$text"
+    fi
+  }
 
   local CERT_PATH="/etc/letsencrypt/live"
   
@@ -2889,9 +2909,17 @@ show_cert_status() {
     # 如果 openssl 執行失敗則跳過
     if [[ -z "$cert_info" ]]; then continue; fi
 
-    # 提取到期日並存入快取
+    # 提取到期日並格式化（只保留年月日和時區）
+    local end_date_raw
+    end_date_raw=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
+    
+    # 格式化日期：從 "Oct 20 01:47:22 2025 GMT" 轉換為 "Oct 20 2025 GMT"
     local end_date
-    end_date=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
+    if [[ -n "$end_date_raw" ]]; then
+      end_date=$(echo "$end_date_raw" | awk '{print $1, $2, $4, $5}')
+    else
+      end_date="無效日期"
+    fi
     cert_expiry_dates["$cert_name"]="$end_date"
 
     # 提取 SAN 列表並存入快取
@@ -2916,7 +2944,15 @@ show_cert_status() {
   nginx_domains=$(grep -rhoE 'server_name\s+[^;]+' "$nginx_conf_paths" 2>/dev/null | \
     sed -E 's/server_name\s+//' | tr ' ' '\n' | grep -E '^[a-zA-Z0-9.-]+$' | sort -u)
 
-  # 遍歷 Nginx 域名，從快取中查詢資訊
+  # --- 第一步：收集所有數據並計算各列最大寬度 ---
+  local data=()
+  local max_domain_len=4    # "域名" 的顯示寬度
+  local max_date_len=6      # "到期日" 的顯示寬度  
+  local max_cert_len=10     # "憑證資料夾" 的顯示寬度
+  local max_status_len=4    # "狀態" 的顯示寬度
+  local max_note_len=4      # "備註" 的顯示寬度
+
+  # 遍歷 Nginx 域名，從快取中查詢資訊並收集數據
   for nginx_domain in $nginx_domains; do
     local matched_cert="-"
     local end_date="無憑證"
@@ -2943,8 +2979,73 @@ show_cert_status() {
       note="CF Origin"
     fi
 
-    printf "%-32s %-26s %-24s %-16s %s\n" \
-      "$nginx_domain" "$end_date" "$matched_cert" "$status" "$note"
+    # 存儲數據
+    data+=("$nginx_domain|$end_date|$matched_cert|$status|$note")
+
+    # 計算各列最大寬度
+    local domain_len=$(display_width "$nginx_domain")
+    local date_len=$(display_width "$end_date")  
+    local cert_len=$(display_width "$matched_cert")
+    local status_len=$(display_width "$status")
+    local note_len=$(display_width "$note")
+
+    if [ $domain_len -gt $max_domain_len ]; then
+      max_domain_len=$domain_len
+    fi
+    if [ $date_len -gt $max_date_len ]; then
+      max_date_len=$date_len
+    fi
+    if [ $cert_len -gt $max_cert_len ]; then
+      max_cert_len=$cert_len
+    fi
+    if [ $status_len -gt $max_status_len ]; then
+      max_status_len=$status_len
+    fi
+    if [ $note_len -gt $max_note_len ]; then
+      max_note_len=$note_len
+    fi
+  done
+
+  # --- 第二步：輸出格式化表格 ---
+  
+  # 輸出表頭
+  pad_left "域名" $max_domain_len
+  printf " "
+  pad_left "到期日" $max_date_len
+  printf " "
+  pad_left "憑證資料夾" $max_cert_len
+  printf " "
+  pad_left "狀態" $max_status_len
+  printf " "
+  printf "備註\n"
+
+  # 輸出分隔線
+  local total_width=$((max_domain_len + max_date_len + max_cert_len + max_status_len + max_note_len + 4))
+  printf '%.0s-' $(seq 1 $total_width)
+  printf "\n"
+
+  # 輸出數據行
+  for row in "${data[@]}"; do
+    IFS='|' read -r nginx_domain end_date matched_cert status note <<< "$row"
+    
+    # 域名
+    pad_left "$nginx_domain" $max_domain_len
+    printf " "
+    
+    # 到期日
+    pad_left "$end_date" $max_date_len
+    printf " "
+    
+    # 憑證資料夾
+    pad_left "$matched_cert" $max_cert_len
+    printf " "
+    
+    # 狀態
+    pad_left "$status" $max_status_len
+    printf " "
+    
+    # 備註
+    printf "%s\n" "$note"
   done
 }
 
