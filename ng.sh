@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.9.6"
+version="6.10.0"
 
 
 # 顏色定義
@@ -1118,7 +1118,7 @@ detect_conf_path() {
   nginx_conf=""
 
   if command -v openresty >/dev/null 2>&1 ; then
-    nginx_conf="/usr/local/openresty/nginx/conf/nginx.conf"
+    nginx_conf="/usr/local/openresy/nginx/conf/nginx.conf"
   elif command -v nginx >/dev/null 2>&1; then
     nginx_conf="/etc/nginx/nginx.conf"
   fi
@@ -1130,7 +1130,9 @@ detect_conf_path() {
   while IFS= read -r line; do
     raw_path=$(echo "$line" | sed -E 's/^[[:space:]]*include[[:space:]]+(.+);/\1/')
     raw_path=$(dirname "$raw_path")
-    raw_path=$(eval echo "$raw_path")
+    if [[ "$raw_path" == \~* ]]; then
+      raw_path="$HOME${raw_path:1}"
+    fi
     [ -z "$raw_path" ] && continue
 
     resolved_path=$(realpath "$raw_path" 2>/dev/null)
