@@ -1118,7 +1118,7 @@ detect_conf_path() {
   nginx_conf=""
 
   if command -v openresty >/dev/null 2>&1 ; then
-    nginx_conf="/usr/local/openresy/nginx/conf/nginx.conf"
+    nginx_conf="/usr/local/openresty/nginx/conf/nginx.conf"
   elif command -v nginx >/dev/null 2>&1; then
     nginx_conf="/etc/nginx/nginx.conf"
   fi
