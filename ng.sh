@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="6.10.0"
+version="7.0.0"
 
 
 # 顏色定義
@@ -614,6 +614,19 @@ check_app(){
       ;;
     2)
       yum install -y redhat-lsb-core
+      ;;
+    esac
+  fi
+  if ! command -v dig &>/dev/null; then
+    case $system in
+    1)
+      apt update && apt install -y dnsutils
+      ;;
+    2)
+      yum install -y bind-utils
+      ;;
+    3)
+      apk add bind-tools
       ;;
     esac
   fi
@@ -2898,7 +2911,7 @@ show_cert_status() {
   # 遍歷一次所有憑證，建立快取
   for cert_dir in "$CERT_PATH"/*; do
     [[ -d "$cert_dir" ]] || continue
-    local cert_file="$cert_dir/cert.pem"
+    local cert_file="$cert_dir/fullchain.pem"
     [[ -f "$cert_file" ]] || continue
 
     local cert_name
@@ -3193,8 +3206,9 @@ ssl_apply() {
   echo "選擇驗證方式："
   echo "1) DNS (Cloudflare)"
   echo "2) DNS (其他供應商)"
-  echo "3) HTTP"
-  read -p "選擇 [1-3]（預設 3）:" auth_method
+  echo "3) DNS (CNAME橋接)"
+  echo "4) HTTP"
+  read -p "選擇 [1-4]（預設 3）:" auth_method
   auth_method="${auth_method:-3}"
 
   IFS=$' ,\n' read -ra domain_array <<< "$domains"
@@ -3243,6 +3257,7 @@ ssl_apply() {
           ;;
       esac
     fi
+    read -p "aaaa"
   elif [ "$auth_method" = 2 ]; then
     echo "您好,此DNS不支持自動續訂,是否繼續? (y/n)"
     read -r continue_choice
@@ -3258,7 +3273,119 @@ ssl_apply() {
       --agree-tos \
       --server "$server_url" \
       "${domain_args[@]}"
+  elif [ "$auth_method" = 3 ]; then
+    local domain_count=${#domain_array[@]}
+    local base_domain=""
 
+    if [ "$domain_count" -eq 1 ]; then
+      # 如果只有一個域名，提取其基礎部分
+      if [[ "${domain_array[0]}" == "*."* ]]; then
+        base_domain="${domain_array[0]:2}"
+      else
+        base_domain="${domain_array[0]}"
+      fi
+    elif [ "$domain_count" -eq 2 ]; then
+      # 如果有兩個域名，進行嚴格的匹配檢查
+      local domain1="${domain_array[0]}"
+      local domain2="${domain_array[1]}"
+
+      # 檢查是否一個是另一個的萬用字元版本 (處理任何順序)
+      if [[ "$domain1" == "*.$domain2" ]] || [[ "$domain2" == "*.$domain1" ]]; then
+        # 提取基礎域名 (永遠是較短的那個)
+        if [ ${#domain1} -lt ${#domain2} ]; then
+          base_domain="$domain1"
+        else
+          base_domain="$domain2"
+        fi
+      else
+        echo -e "${RED}無效的域名組合。${RESET}"
+        echo "             如果您提供兩個域名，它們必須是匹配的根域名和萬用字元域名 (例如: 'example.com *.example.com')。"
+        sleep 2
+        return 1
+      fi
+    else
+      echo -e "${RED}域名數量無效。${RESET}"
+      echo "             此模式只支援單一域名或一對匹配的域名。"
+      sleep 1
+      return 1
+    fi
+    local STATE_FILE="/opt/certbot-hook/certbot_domain.json"
+    if ! [ -f "$STATE_FILE" ]; then
+      echo "{}" > "$STATE_FILE"
+    fi
+    local RANDOM_PART=""
+    while true; do
+      RANDOM_PART="$(head /dev/urandom | tr -dc a-z0-9 | head -c 8)"
+      if ! jq -e --arg prefix "${RANDOM_PART}." '.[] | select(startswith($prefix))' "$STATE_FILE" > /dev/null; then
+        break
+      fi
+    done
+    local cname=""
+    echo "請先新增CNAME: _acme-challenge.$base_domain CNAME $RANDOM_PART.gebu8f.de"
+    read -p "若新增完成按任意鍵繼續" -n1
+    local success=""
+    success=0
+    for i in {1..12}; do
+      echo "第 $i 次檢查中..."
+
+      cname=$(dig +short CNAME "_acme-challenge.$base_domain" @1.1.1.1)
+
+      # 如果 1.1.1.1 查不到，就用 IPv6 DNS 再查
+      if [ -z "$cname" ]; then
+        cname=$(dig +short CNAME "_acme-challenge.$base_domain" @2606:4700:4700::1111)
+      fi
+
+      # 去掉尾端的點
+      cname=$(echo "$cname" | sed 's/\.$//')
+
+      if [ "$cname" = "$RANDOM_PART.gebu8f.de" ]; then
+        echo -e "${GREEN}驗證成功: $cname${RESET}"
+        success=1
+        break
+      else
+        sleep 10
+      fi
+    done
+
+    if [ $success -ne 1 ]; then
+      echo -e "${RED}驗證失敗${RESET}"
+      return 1
+    fi
+    mkdir -p "/opt/certbot-hook"
+    if ! [ -f /opt/certbot-hook/cf-hook.sh ]; then
+      wget -q -O /opt/certbot-hook/cf-hook.sh https://files.gebu8f.com/files/cf-hook.sh
+      chmod +x /opt/certbot-hook/cf-hook.sh
+    fi
+    certbot certonly \
+      --manual \
+      --preferred-challenges "dns-01" \
+      --email "$selected_email" \
+      --key-type rsa \
+      --agree-tos \
+      --server "$server_url" \
+      --manual-auth-hook "/opt/certbot-hook/cf-hook.sh add_TXT $RANDOM_PART.gebu8f.de" \
+      --manual-cleanup-hook "/opt/certbot-hook/cf-hook.sh del_TXT" \
+      "${domain_args[@]}"
+    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+      (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
+      echo "已加入自動續訂任務（每天凌晨3點）"
+
+      # 啟動 crond
+      case $system in
+      1)
+        systemctl enable cron
+        systemctl start cron
+        ;;
+      2)
+        systemctl enable crond
+        systemctl start crond
+        ;;
+      3)
+        rc-update add crond default
+        rc-service crond start
+        ;;
+      esac
+    fi
   else
     if [[ "$domains" =~ \*\. ]]; then
       echo "您好,HTTP驗證不能使用泛域名"
