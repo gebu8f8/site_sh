@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.0.0"
+version="7.0.1"
 
 
 # 顏色定義
@@ -1103,7 +1103,7 @@ default(){
   generate_ssl_cert
   case "$system" in
   1|2)
-    if [ mode == openresty ]; then
+    if [ $mode == openresty ]; then
       rm -f /etc/nginx/nginx.conf
       wget -O /etc/nginx/nginx.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
       id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
@@ -1127,48 +1127,50 @@ default(){
 }
 
 detect_conf_path() {
-  conf_paths=()
-  nginx_conf=""
-
+  local nginx_conf=""
   if command -v openresty >/dev/null 2>&1 ; then
     nginx_conf="/usr/local/openresty/nginx/conf/nginx.conf"
   elif command -v nginx >/dev/null 2>&1; then
     nginx_conf="/etc/nginx/nginx.conf"
   fi
 
-  [ -f "$nginx_conf" ] || { echo -e "${RED}無法找到 nginx 配置文件${RESET}" >&2; return 1; }
-
-  include_lines=$(sed -n '/http[[:space:]]*{/,/^}/p' "$nginx_conf" | tr -d '\r' | grep -E 'include[[:space:]]+[^;]*\*[^;]*;')
-
-  while IFS= read -r line; do
-    raw_path=$(echo "$line" | sed -E 's/^[[:space:]]*include[[:space:]]+(.+);/\1/')
-    raw_path=$(dirname "$raw_path")
-    if [[ "$raw_path" == \~* ]]; then
-      raw_path="$HOME${raw_path:1}"
-    fi
-    [ -z "$raw_path" ] && continue
-
-    resolved_path=$(realpath "$raw_path" 2>/dev/null)
-    [ -z "$resolved_path" ] && resolved_path="$raw_path"
-
-    conf_paths+=("$resolved_path")
-  done <<< "$include_lines"
-
-  for path in "${conf_paths[@]}"; do
-    if ls "$path"/* >/dev/null 2>&1; then
-      echo "$path"
-      return 0
-    fi
-  done
-
-  if command -v openresty >/dev/null 2>&1; then
-    conf_path="/usr/local/openresty/nginx/conf/conf.d"
-  elif command -v nginx >/dev/null 2>&1; then
-    conf_path="/etc/nginx/conf.d"
+  if [ ! -f "$nginx_conf" ]; then
+    echo -e "${RED}錯誤：找不到 Nginx 設定檔 ${nginx_conf}${RESET}" >&2
+    return 1
   fi
 
-  mkdir -p "$conf_path"
-  echo "$conf_path"
+  # 步驟 1: 尋找帶有萬用字元的 include 語句
+  # 使用 () 來捕獲我們真正需要的路徑部分
+  local search_regex='^[[:space:]]*include[[:space:]]+([^;]*\*[^;]*);'
+  
+  # 步驟 2: 使用 sed 的 -E 參數 (擴充型正則表達式) 來搜尋並擷取
+  local included_path=$(sed -E -n "s/${search_regex}/\1/p" "$nginx_conf" | head -n 1)
+
+  # 步驟 3: 判斷是否找到了 include 路徑
+  if [[ -n "$included_path" ]]; then
+
+    # 從路徑中提取目錄部分
+    local target_dir
+    target_dir=$(dirname "$included_path")
+
+    # 確保目錄存在
+    mkdir -p "$target_dir"
+    
+    echo "$target_dir"
+    return 0
+  fi
+
+  # --- 預設/備援邏輯 ---
+  # 如果前面的步驟沒有成功找到 include 規則，則執行這裡
+  local default_conf_dir=""
+  if command -v openresty >/dev/null 2>&1; then
+    default_conf_dir="/usr/local/openresty/nginx/conf/conf.d"
+  else
+    default_conf_dir="/etc/nginx/conf.d"
+  fi
+  
+  mkdir -p "$default_conf_dir"
+  echo "$default_conf_dir"
 }
 detect_sites() {
   local app_type="$1"
@@ -3257,7 +3259,6 @@ ssl_apply() {
           ;;
       esac
     fi
-    read -p "aaaa"
   elif [ "$auth_method" = 2 ]; then
     echo "您好,此DNS不支持自動續訂,是否繼續? (y/n)"
     read -r continue_choice
@@ -3315,13 +3316,13 @@ ssl_apply() {
     fi
     local RANDOM_PART=""
     while true; do
-      RANDOM_PART="$(head /dev/urandom | tr -dc a-z0-9 | head -c 8)"
+      RANDOM_PART="$(head /dev/urandom | tr -dc a-z0-9 | head -c 10)"
       if ! jq -e --arg prefix "${RANDOM_PART}." '.[] | select(startswith($prefix))' "$STATE_FILE" > /dev/null; then
         break
       fi
     done
     local cname=""
-    echo "請先新增CNAME: _acme-challenge.$base_domain CNAME $RANDOM_PART.gebu8f.de"
+    echo "請先新增CNAME: _acme-challenge.$base_domain CNAME $RANDOM_PART.ssl.gebu8f.de"
     read -p "若新增完成按任意鍵繼續" -n1
     local success=""
     success=0
@@ -3338,7 +3339,7 @@ ssl_apply() {
       # 去掉尾端的點
       cname=$(echo "$cname" | sed 's/\.$//')
 
-      if [ "$cname" = "$RANDOM_PART.gebu8f.de" ]; then
+      if [ "$cname" = "$RANDOM_PART.ssl.gebu8f.de" ]; then
         echo -e "${GREEN}驗證成功: $cname${RESET}"
         success=1
         break
@@ -3363,7 +3364,7 @@ ssl_apply() {
       --key-type rsa \
       --agree-tos \
       --server "$server_url" \
-      --manual-auth-hook "/opt/certbot-hook/cf-hook.sh add_TXT $RANDOM_PART.gebu8f.de" \
+      --manual-auth-hook "/opt/certbot-hook/cf-hook.sh add_TXT $RANDOM_PART.ssl.gebu8f.de" \
       --manual-cleanup-hook "/opt/certbot-hook/cf-hook.sh del_TXT" \
       "${domain_args[@]}"
     if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
