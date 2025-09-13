@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.1.0"
+version="7.1.1"
 
 
 # 顏色定義
@@ -1837,6 +1837,7 @@ install_web_server(){
           sleep 1
           return 1
         fi
+        mkdir -p /usr/local/src/ && cd /usr/local/src/
         curl -O https://openresty.org/download/openresty-$ver.tar.gz
         tar -xzvf openresty-$ver.tar.gz
         rm openresty-$ver.tar.gz
@@ -1844,7 +1845,6 @@ install_web_server(){
         ./configure --prefix=/usr/local/openresty \
           --with-compat \
           --with-threads \
-          --with-ipv6 \
           --with-pcre-jit \
           --with-http_ssl_module \
           --with-http_v2_module \
@@ -1861,6 +1861,38 @@ install_web_server(){
         ln -s /usr/local/openresty/bin/openresty /usr/local/bin/openresty
         ln -s /usr/local/openresty/nginx/sbin/nginx /usr/local/bin/nginx
         ln -s /usr/local/openresty/bin/resty /usr/local/bin/resty
+        cat > /etc/init.d/openresty << 'EOF'
+#!/sbin/openrc-run
+
+name="openresty"
+description="OpenResty Web Platform"
+
+command="/usr/local/openresty/nginx/sbin/nginx"
+command_args="-p /usr/local/openresty/nginx/ -c /usr/local/openresty/nginx/conf/nginx.conf"
+pidfile="/usr/local/openresty/nginx/logs/nginx.pid"
+
+depend() {
+    need net
+    use dns logger
+}
+
+start_pre() {
+    checkpath --directory --mode 0755 /usr/local/openresty/nginx/logs
+}
+
+reload() {
+    ebegin "Reloading $name"
+    if [ -f "$pidfile" ]; then
+        start-stop-daemon --signal HUP --pidfile "$pidfile"
+        eend $?
+    else
+        eend 1 "PID file not found, is $name running?"
+    fi
+}
+EOF
+      chmod +x /etc/init.d/openresty
+      rc-update add openresty default
+      rc-service openresty start
       else
         apk update
         apk add --no-cache pcre openssl curl gnupg
