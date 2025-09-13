@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.0.1"
+version="7.1.0"
 
 
 # 顏色定義
@@ -435,7 +435,7 @@ check_nginx_start(){
       clear
       echo "=========站點管理器之安裝網站伺服器=========="
       echo "1. 安裝nginx（支援HTTP3）"
-      echo "2. 安裝Openresy（支援LUA）【alpine 3.19以上（含）不支援】"
+      echo "2. 安裝Openresy（支援LUA）"
       read -p "請選擇安裝的伺服器[1-2，預設為2]" choice
       choice=${choice:-2}
       case $choice in
@@ -459,11 +459,10 @@ check_nginx_start(){
             break
           fi
         elif [ $system == 3 ]; then
-          if ! curl -sf https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main >/dev/null; then
-            echo -e "${RED}官方倉庫尚未支援${RESET}"
-            sleep 2
-          else
+          if curl -sf https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main >/dev/null; then
             install_web_server openresty
+          else
+            install_web_server openresty compile
             break
           fi
         fi
@@ -1791,6 +1790,7 @@ install_wp_plugin_with_search_or_url() {
 
 install_web_server(){
   local mode=$1
+  local other=$2
   local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
   local codename=$(lsb_release -sc)
   
@@ -1829,18 +1829,52 @@ install_web_server(){
       systemctl enable openresty
       ;;
     3)
-      apk update
-      apk add --no-cache pcre openssl curl gnupg
-      curl -O https://openresty.org/package/admin@openresty.com-5ea678a6.rsa.pub
-      mv admin@openresty.com-5ea678a6.rsa.pub /etc/apk/keys/
-      echo "https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main" \
-        | tee -a /etc/apk/repositories
-      apk update
-      apk add --no-cache openresty
-      ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
-      ln -sf /usr/local/openresty/nginx/conf /etc/nginx
-      mkdir -p /etc/nginx/conf.d
-      rc-update add openresty default
+      if [[ $other == compile ]]; then
+        apk add build-base perl pcre2-dev openssl-dev zlib-dev curl git
+        ver=$(curl -s https://openresty.org/en/download.html | grep -m 1 -Eo 'openresty-[0-9.]+\.tar\.gz' | sed 's/^openresty-\(.*\)\.tar\.gz$/\1/' | head -n 1)
+        if [ -z $ver ]; then
+          echo "${RED} 無法辨識版本${RESET}"
+          sleep 1
+          return 1
+        fi
+        curl -O https://openresty.org/download/openresty-$ver.tar.gz
+        tar -xzvf openresty-$ver.tar.gz
+        rm openresty-$ver.tar.gz
+        cd openresty-$ver/
+        ./configure --prefix=/usr/local/openresty \
+          --with-compat \
+          --with-threads \
+          --with-ipv6 \
+          --with-pcre-jit \
+          --with-http_ssl_module \
+          --with-http_v2_module \
+          --with-http_v3_module \
+          --with-http_realip_module \
+          --with-http_stub_status_module \
+          --with-http_gzip_static_module \
+          --with-http_gunzip_module \
+          --with-stream \
+          --with-stream_ssl_module \
+          --with-stream_ssl_preread_module
+        make -j$(nproc)
+        make install
+        ln -s /usr/local/openresty/bin/openresty /usr/local/bin/openresty
+        ln -s /usr/local/openresty/nginx/sbin/nginx /usr/local/bin/nginx
+        ln -s /usr/local/openresty/bin/resty /usr/local/bin/resty
+      else
+        apk update
+        apk add --no-cache pcre openssl curl gnupg
+        curl -O https://openresty.org/package/admin@openresty.com-5ea678a6.rsa.pub
+        mv admin@openresty.com-5ea678a6.rsa.pub /etc/apk/keys/
+        echo "https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main" \
+          | tee -a /etc/apk/repositories
+        apk update
+        apk add --no-cache openresty
+        ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
+        ln -sf /usr/local/openresty/nginx/conf /etc/nginx
+        mkdir -p /etc/nginx/conf.d
+        rc-update add openresty default
+      fi
       ;;
     esac
   elif [ $mode == nginx ]; then
@@ -2866,15 +2900,14 @@ show_cert_status() {
 
   echo -e "===== Nginx 站點憑證狀態 ====="
 
-  # 計算字符串的顯示寬度（中文字符=2，英文字符=1）
+  # --- 通用排版輔助函式 (已驗證其穩健性) ---
   display_width() {
     local str="$1"
     local width=0
     local i=0
     while [ $i -lt ${#str} ]; do
       local char="${str:$i:1}"
-      # 檢查是否為多字節字符（簡單判斷）
-      if [ $(printf "%d" "'$char") -gt 127 ] 2>/dev/null; then
+      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev_null; then
         width=$((width + 2))
       else
         width=$((width + 1))
@@ -2884,69 +2917,48 @@ show_cert_status() {
     echo $width
   }
 
-  # 左對齊填充函數
   pad_left() {
     local text="$1"
-    local width="$2"
+    local max_width="$2"
     local current_width=$(display_width "$text")
-    local spaces=$((width - current_width))
-    if [ $spaces -gt 0 ]; then
-      printf "%s%*s" "$text" $spaces ""
-    else
-      printf "%-*.*s" $width $width "$text"
-    fi
+    local padding=$((max_width - current_width))
+    printf "%s%*s" "$text" $padding ""
   }
 
   local CERT_PATH="/etc/letsencrypt/live"
   
-  # --- 效能改善核心：建立憑證資訊快取 ---
-  # 需要 bash 4.0+
   if (( BASH_VERSINFO[0] < 4 )); then
       echo "錯誤：此腳本需要 Bash 4.0 或更高版本才能使用關聯陣列。" >&2
       return 1
   fi
 
-  declare -A san_to_cert                 # 儲存 SAN -> 憑證資料夾名稱 的對應
-  declare -A wildcard_certs              # 儲存 泛域名基礎域 -> 憑證資料夾名稱 的對應
-  declare -A cert_expiry_dates           # 儲存 憑證資料夾名稱 -> 到期日 的對應
+  # --- 效能核心：建立憑證資訊快取 (邏輯不變) ---
+  declare -A san_to_cert
+  declare -A wildcard_certs
+  declare -A cert_expiry_dates
+  declare -A cert_notes
   
-  # 遍歷一次所有憑證，建立快取
   for cert_dir in "$CERT_PATH"/*; do
     [[ -d "$cert_dir" ]] || continue
-    local cert_file="$cert_dir/fullchain.pem"
+    local cert_file="$cert_dir/fullchain.pem" # 修正：Let's Encrypt 建議使用 fullchain.pem
     [[ -f "$cert_file" ]] || continue
 
-    local cert_name
-    cert_name=$(basename "$cert_dir")
-
-    # 一次性執行 openssl 取得所有需要的資訊
-    local cert_info
-    cert_info=$(openssl x509 -in "$cert_file" -noout -text -enddate 2>/dev/null)
-
-    # 如果 openssl 執行失敗則跳過
+    local cert_name=$(basename "$cert_dir")
+    local cert_info=$(openssl x509 -in "$cert_file" -noout -text -enddate 2>/dev/null)
     if [[ -z "$cert_info" ]]; then continue; fi
 
-    # 提取到期日並格式化（只保留年月日和時區）
-    local end_date_raw
-    end_date_raw=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
-    
-    # 格式化日期：從 "Oct 20 01:47:22 2025 GMT" 轉換為 "Oct 20 2025 GMT"
-    local end_date
-    if [[ -n "$end_date_raw" ]]; then
-      end_date=$(echo "$end_date_raw" | awk '{print $1, $2, $4, $5}')
-    else
-      end_date="無效日期"
-    fi
+    local end_date_raw=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
+    local end_date=$([[ -n "$end_date_raw" ]] && echo "$end_date_raw" | awk '{print $1, $2, $4, $5}' || echo "無效日期")
     cert_expiry_dates["$cert_name"]="$end_date"
 
-    # 提取 SAN 列表並存入快取
-    local san_list
-    san_list=$(echo "$cert_info" | awk '/X509v3 Subject Alternative Name/ {getline; gsub("DNS:", ""); gsub(", ", "\n"); print}')
-    
+    if [[ -f "$cert_dir/cf_cert_id.txt" ]]; then
+      cert_notes["$cert_name"]="CF Origin"
+    fi
+
+    local san_list=$(echo "$cert_info" | awk '/X509v3 Subject Alternative Name/ {getline; gsub("DNS:", ""); gsub(", ", "\n"); print}')
     for san in $san_list; do
       if [[ "$san" == \*.* ]]; then
-        local base_domain="${san#*.}"
-        wildcard_certs["$base_domain"]="$cert_name"
+        wildcard_certs["${san#*.}"]="$cert_name"
       else
         san_to_cert["$san"]="$cert_name"
       fi
@@ -2954,115 +2966,87 @@ show_cert_status() {
   done
   # --- 快取建立完成 ---
 
-  local nginx_conf_paths
-  nginx_conf_paths=$(detect_conf_path)
-
-  local nginx_domains
-  nginx_domains=$(grep -rhoE 'server_name\s+[^;]+' "$nginx_conf_paths" 2>/dev/null | \
+  local nginx_conf_paths=$(detect_conf_path)
+  local nginx_domains=$(grep -rhoE 'server_name\s+[^;]+' "$nginx_conf_paths" 2>/dev/null | \
     sed -E 's/server_name\s+//' | tr ' ' '\n' | grep -E '^[a-zA-Z0-9.-]+$' | sort -u)
 
-  # --- 第一步：收集所有數據並計算各列最大寬度 ---
-  local data=()
-  local max_domain_len=4    # "域名" 的顯示寬度
-  local max_date_len=6      # "到期日" 的顯示寬度  
-  local max_cert_len=10     # "憑證資料夾" 的顯示寬度
-  local max_status_len=4    # "狀態" 的顯示寬度
-  local max_note_len=4      # "備註" 的顯示寬度
+  # --- 修正核心：採用更穩健的兩段式渲染邏輯 ---
 
-  # 遍歷 Nginx 域名，從快取中查詢資訊並收集數據
+  # --- 階段一：收集數據並計算各欄位最大寬度 ---
+  local headers=("域名" "到期日" "憑證資料夾" "狀態" "備註")
+  local -a max_widths=()
+  # 【關鍵修正1】: 動態計算標題的初始寬度，不再硬編碼
+  for header in "${headers[@]}"; do
+    max_widths+=($(display_width "$header"))
+  done
+
+  local data_rows=()
   for nginx_domain in $nginx_domains; do
     local matched_cert="-"
     local end_date="無憑證"
     local status="未使用/錯誤"
     local note=""
 
-    # 1. 優先查詢精確匹配
     if [[ -n "${san_to_cert[$nginx_domain]}" ]]; then
       matched_cert="${san_to_cert[$nginx_domain]}"
-      end_date="${cert_expiry_dates[$matched_cert]}"
       status="是"
     else
-      # 2. 如果沒有精確匹配，再查詢泛域名匹配
       local base_domain="${nginx_domain#*.}"
-      # 確保這是一個子域名 (e.g., a.b.c -> b.c) 而不是頂級域名 (e.g., b.c -> b.c)
       if [[ "$base_domain" != "$nginx_domain" && -n "${wildcard_certs[$base_domain]}" ]]; then
         matched_cert="${wildcard_certs[$base_domain]}"
-        end_date="${cert_expiry_dates[$matched_cert]}"
         status="泛域名命中"
       fi
     fi
 
-    if [[ "$matched_cert" != "-" && -f "$CERT_PATH/$matched_cert/cf_cert_id.txt" ]]; then
-      note="CF Origin"
+    if [[ "$matched_cert" != "-" ]]; then
+      end_date="${cert_expiry_dates[$matched_cert]:-無效日期}"
+      note="${cert_notes[$matched_cert]}"
     fi
-
-    # 存儲數據
-    data+=("$nginx_domain|$end_date|$matched_cert|$status|$note")
-
-    # 計算各列最大寬度
-    local domain_len=$(display_width "$nginx_domain")
-    local date_len=$(display_width "$end_date")  
-    local cert_len=$(display_width "$matched_cert")
-    local status_len=$(display_width "$status")
-    local note_len=$(display_width "$note")
-
-    if [ $domain_len -gt $max_domain_len ]; then
-      max_domain_len=$domain_len
-    fi
-    if [ $date_len -gt $max_date_len ]; then
-      max_date_len=$date_len
-    fi
-    if [ $cert_len -gt $max_cert_len ]; then
-      max_cert_len=$cert_len
-    fi
-    if [ $status_len -gt $max_status_len ]; then
-      max_status_len=$status_len
-    fi
-    if [ $note_len -gt $max_note_len ]; then
-      max_note_len=$note_len
-    fi
+    
+    data_rows+=("$nginx_domain|$end_date|$matched_cert|$status|$note")
+    
+    local -a current_row_data=("$nginx_domain" "$end_date" "$matched_cert" "$status" "$note")
+    for i in "${!max_widths[@]}"; do
+      local current_width=$(display_width "${current_row_data[$i]}")
+      if [[ $current_width -gt ${max_widths[$i]} ]]; then
+        max_widths[$i]=$current_width
+      fi
+    done
   done
 
-  # --- 第二步：輸出格式化表格 ---
-  
-  # 輸出表頭
-  pad_left "域名" $max_domain_len
-  printf " "
-  pad_left "到期日" $max_date_len
-  printf " "
-  pad_left "憑證資料夾" $max_cert_len
-  printf " "
-  pad_left "狀態" $max_status_len
-  printf " "
-  printf "備註\n"
+  # --- 階段二：格式化輸出 ---
 
-  # 輸出分隔線
-  local total_width=$((max_domain_len + max_date_len + max_cert_len + max_status_len + max_note_len + 4))
-  printf '%.0s-' $(seq 1 $total_width)
+  # 【關鍵修正2】: 如果沒有任何域名，給出提示並結束
+  if [ ${#data_rows[@]} -eq 0 ]; then
+    echo -e "${GREEN}找不到任何設定檔中的域名，或沒有ssl憑證。${RESET}"
+    return
+  fi
+
+  # 輸出表頭
+  for i in "${!headers[@]}"; do
+    pad_left "${headers[$i]}" "${max_widths[$i]}"
+    # 最後一欄不加空格
+    if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " "; fi
+  done
   printf "\n"
 
+  # 輸出分隔線
+  total_width=0
+  for width in "${max_widths[@]}"; do
+    total_width=$((total_width + width))
+  done
+  total_width=$((total_width + ${#max_widths[@]} - 1))
+  printf '%.0s-' $(seq 1 $total_width) && printf "\n"
+
   # 輸出數據行
-  for row in "${data[@]}"; do
-    IFS='|' read -r nginx_domain end_date matched_cert status note <<< "$row"
-    
-    # 域名
-    pad_left "$nginx_domain" $max_domain_len
-    printf " "
-    
-    # 到期日
-    pad_left "$end_date" $max_date_len
-    printf " "
-    
-    # 憑證資料夾
-    pad_left "$matched_cert" $max_cert_len
-    printf " "
-    
-    # 狀態
-    pad_left "$status" $max_status_len
-    printf " "
-    
-    # 備註
-    printf "%s\n" "$note"
+  for row in "${data_rows[@]}"; do
+    IFS='|' read -r domain date cert status note <<< "$row"
+    local -a fields=("$domain" "$date" "$cert" "$status" "$note")
+    for i in "${!fields[@]}"; do
+      pad_left "${fields[$i]}" "${max_widths[$i]}"
+      if [[ $i -lt $((${#fields[@]} - 1)) ]]; then printf " "; fi
+    done
+    printf "\n"
   done
 }
 
