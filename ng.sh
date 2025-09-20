@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.1.1"
+version="7.2.0"
 
 
 # 顏色定義
@@ -115,7 +115,8 @@ backup_site_type_clean() {
         return 1
     fi
     echo "正在清理 $type 備份，只保留最新 $keep_count 份..."
-    ls -1t "$backup_dir"/backup-*.tar.gz 2>/dev/null | tail -n +$((keep_count + 1)) | xargs -r rm -f
+    find "$backup_dir" -name "backup-*.tar.gz" -type f -printf '%T@ %p\n' | \
+    sort -rn | tail -n +$((keep_count + 1)) | cut -d' ' -f2- | xargs -r rm -f
     echo -e "${GREEN}清理完成。${RESET}"
 }
 
@@ -129,83 +130,81 @@ backup_site_type() {
     local backup_file="$backup_dir/backup-$timestamp.tar.gz"
     mkdir -p "$backup_dir"
 
+    # --- 資料庫備份 (DB Backup) ---
+    local db_name=""
+    local dba_export_dir="/root/mysql_backups"
+
+    echo "正在偵測資料庫設定..."
+
     if [[ "$type" == "wp" ]]; then
         local wp_config="$web_root/wp-config.php"
-        local tmp_sql="$backup_dir/db-$timestamp.sql"
-        local mysqldump_cmd=""
-        local mysql_root_pass=""
-        local db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$wp_config")  
-
-        # 嘗試無密碼登入
-        if mysqldump -uroot --no-data mysql >/dev/null 2>&1; then
-          mysqldump_cmd="mysqldump -uroot"
-        else
-          # 嘗試讀取密碼檔
-          if [[ -f /etc/mysql-pass.conf ]]; then
-            mysql_root_pass=$(cat /etc/mysql-pass.conf)
-            if mysqldump -uroot -p"$mysql_root_pass" --no-data mysql >/dev/null 2>&1; then
-              mysqldump_cmd="mysqldump -uroot -p$mysql_root_pass"
-            fi
-          else
-            read -s -p "請輸入 MySQL root 密碼：" mysql_root_pass
-            echo
-            if mysqldump -uroot -p"$mysql_root_pass" --no-data mysql >/dev/null 2>&1; then
-              mysqldump_cmd="mysqldump -uroot -p$mysql_root_pass"
-            else
-              echo -e "${RED}無法用該密碼登入 MySQL，備份失敗！${RESET}"
-                return 1
-            fi
-          fi
-        fi
-        $mysqldump_cmd --single-transaction --routines --triggers --events "$db_name" > "$tmp_sql"
-        
-        if [[ $? -ne 0 ]]; then
-            echo -e "${RED}資料庫備份失敗！${RESET}"
-            rm -f "$tmp_sql"
+        db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$wp_config")
+    elif [[ "$type" == "flarum" ]]; then
+        local config="$web_root/config.php"
+        if [[ ! -f "$config" ]]; then
+            echo -e "${RED}找不到 config.php${RESET}"
             return 1
         fi
-        echo "正在打包網站檔案..."
-        cp "$tmp_sql" "$web_root/"
-        tar -czf "$backup_file" -C "$web_root" .
-        rm -f "$web_root/$(basename "$tmp_sql")"
-        rm -f "$tmp_sql"
-        echo -e "${GREEN} 備份完成！檔案位置：$backup_file${RESET}"
-    elif [[ "$type" == "flarum" ]]; then
-      local config="$web_root/config.php"
-      if [[ ! -f "$config" ]]; then
-        echo -e "${RED}找不到 config.php${RESET}"
-        return 1
-      fi
-
-      local db_name=$(php -r "\$c = include '$config'; echo \$c['database']['database'] ?? '';")
-      local db_user=$(php -r "\$c = include '$config'; echo \$c['database']['username'] ?? '';")
-      local db_pass=$(php -r "\$c = include '$config'; echo \$c['database']['password'] ?? '';")
-
-      if [[ -z "$db_name" || -z "$db_user" ]]; then
-        echo -e "${RED}無法讀取 Flarum DB 設定${RESET}"
-        return 1
-      fi
-
-      echo "正在匯出 Flarum 資料庫 $db_name..."
-      local tmp_sql="$backup_dir/db-$timestamp.sql"
-      mysqldump -u"$db_user" -p"$db_pass" "$db_name" > "$tmp_sql"
-      if [[ $? -ne 0 ]]; then
-          echo -e "${RED}資料庫備份失敗！${RESET}"
-          rm -f "$tmp_sql"
-          return 1
-      fi
-
-      # ✅ 把 SQL 複製到 web_root 一起打包
-      cp "$tmp_sql" "$web_root/"
-      echo "正在打包 Flarum 全部檔案..."
-      tar -czf "$backup_file" -C "$web_root" .
-      rm -f "$web_root/$(basename "$tmp_sql")"
-      rm -f "$tmp_sql"
-      echo -e "${GREEN}備份完成！檔案位置：$backup_file${RESET}"
+        db_name=$(php -r "\$c = include '$config'; echo \$c['database']['database'] ?? '';")
     else
         echo -e "${RED}不支援的站點類型：$type${RESET}"
         return 1
     fi
+
+    if [[ -z "$db_name" ]]; then
+        echo -e "${RED}無法從設定檔中讀取到資料庫名稱！${RESET}"
+        return 1
+    fi
+
+    echo "資料庫名稱為 '$db_name'。開始使用 'dba' 工具匯出..."
+
+    if ! command -v dba >/dev/null 2>&1; then
+      echo "沒有安裝dba 指令,正在嘗試安裝..."
+      bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
+    fi 
+    
+    if ! dba mysql export "$db_name"; then
+      echo -e "${RED}使用 'dba' 工具備份資料庫失敗！${RESET}"
+      sleep 5
+      return 1
+    fi
+
+
+    # 因為路徑是固定的，我們需要找到剛剛生成的檔案
+    # 'ls -t' 按修改時間排序，'head -n1' 取最新的那一個
+    local latest_sql_export=$(ls -t "${dba_export_dir}/${db_name}"_*.sql 2>/dev/null | head -n1)
+
+    if [[ ! -f "$latest_sql_export" ]]; then
+        echo -e "${RED}資料庫備份指令執行成功，但在預期目錄中找不到 SQL 檔案！(${dba_export_dir})${RESET}"
+        return 1
+    fi
+
+    echo -e "${GREEN}資料庫已成功匯出至：$latest_sql_export${RESET}"
+
+
+    # --- 網站檔案打包 (File Archiving) ---
+    echo "正在打包網站檔案及資料庫備份..."
+
+    # ✅ 把最新的 SQL 備份從 dba 的預設路徑複製到 web_root 一起打包
+    cp "$latest_sql_export" "$web_root/"
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}無法複製 SQL 備份檔案，打包中止！${RESET}"
+        rm -f "$latest_sql_export" # 清理 dba 生成的原始 sql
+        return 1
+    fi
+
+    # 進行打包
+    tar -czf "$backup_file" -C "$web_root" .
+
+    # --- 清理工作 (Cleanup) ---
+    echo "清理臨時檔案..."
+    # 移除被複製到 web_root 的 SQL 檔案
+    rm -f "$web_root/$(basename "$latest_sql_export")"
+    # 移除 dba 在 /root/mysql_backups 生成的原始 SQL 檔案
+    rm -f "$latest_sql_export"
+    
+    echo -e "${GREEN}備份完成！檔案位置：$backup_file${RESET}"
 }
 
 # 主備份流程，支援多站型，清理多餘備份由自動備份排程一併處理
@@ -3378,6 +3377,7 @@ ssl_apply() {
       --preferred-challenges "dns-01" \
       --email "$selected_email" \
       --key-type rsa \
+      --reuse-key \
       --agree-tos \
       --server "$server_url" \
       --manual-auth-hook "/opt/certbot-hook/cf-hook.sh add_TXT $RANDOM_PART.ssl.gebu8f.de" \
