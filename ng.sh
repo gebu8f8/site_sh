@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.2.2"
+version="7.2.1"
 
 
 # 顏色定義
