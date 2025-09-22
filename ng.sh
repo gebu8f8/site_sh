@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.2.1"
+version="7.3.0"
 
 
 # 顏色定義
@@ -803,7 +803,7 @@ check_php_ext_available() {
 
   return 1
 }
-cf_cert_autogen() {
+cf_cert_autogen() (
     key_file="/ssl_ca/.cf_origin.key"
     enc_file="/ssl_ca/.cf_origin.enc"
 
@@ -842,7 +842,7 @@ cf_cert_autogen() {
     done
 
     # 4. 呼叫 Cloudflare API 抓 zone 列表，自動匹配 base domain
-    echo "🔍 正在查詢你帳號下的託管根域名..."
+    echo "正在查詢你帳號下的託管根域名..."
     response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones" \
         -H "X-Auth-Email: $cf_email" \
         -H "X-Auth-Key: $cf_api_key" \
@@ -900,12 +900,16 @@ cf_cert_autogen() {
         echo -e "${RED}憑證申請失敗，錯誤如下：${RESET}"
         echo "$response" | jq
     fi
-}
+)
 
-cf_cert_revoke() {
-    local input_domain="$1"
-    local key_file="/ssl_ca/.cf_origin.key"
-    local enc_file="/ssl_ca/.cf_origin.enc"
+cf_cert_revoke() (
+    input_domain="$1"
+    key_file="/ssl_ca/.cf_origin.key"
+    enc_file="/ssl_ca/.cf_origin.enc"
+    cf_cred=""
+    cf_api_key=""
+    cf_email=""
+    
 
     echo "===== Cloudflare Origin 憑證吊銷器 ====="
 
@@ -963,7 +967,7 @@ cf_cert_revoke() {
     else
         echo "取消吊銷"
     fi
-}
+)
 
 change_wp_admin_username() {
   local domain="$1"
@@ -2630,78 +2634,90 @@ restore_site_files() {
   esac
 }
 
-
 restore_site_db() {
-  local type="$1"
-  local domain="$2"
-  local site_path="/var/www/$domain"
-  local backup_file=""
-  local db_name db_user db_pass
+    local type="$1"
+    local domain="$2"
+    local site_path="/var/www/$domain"
+    local db_name=""
+    local db_user=""
+    local db_pass=""
+    local auto_detected_sql_file=""
 
-  if [[ "$type" == "wp" ]]; then
-    local config="$site_path/wp-config.php"
-    if [[ ! -f "$config" ]]; then
-      echo -e "${RED}找不到 wp-config.php${RESET}"
-      return 1
+    echo "正在從網站設定檔中讀取資料庫憑證..."
+
+    # --- 步驟 1：根據網站類型，安全地讀取資料庫憑證 ---
+    if [[ "$type" == "wp" ]]; then
+        local config="$site_path/wp-config.php"
+        if [[ ! -f "$config" ]]; then
+            echo -e "${RED}錯誤：在 '$site_path' 中找不到 wp-config.php 檔案${RESET}"
+            return 1
+        fi
+        db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$config")
+        db_user=$(awk -F"'" '/DB_USER/{print $4}' "$config")
+        db_pass=$(awk -F"'" '/DB_PASSWORD/{print $4}' "$config")
+
+    elif [[ "$type" == "flarum" ]]; then
+        local config="$site_path/config.php"
+        # ... (Flarum 的憑證讀取邏輯照舊) ...
+        db_name=$(php -r "\$c = include '$config'; echo \$c['database']['database'] ?? '';")
+        db_user=$(php -r "\$c = include '$config'; echo \$c['database']['username'] ?? '';")
+        db_pass=$(php -r "\$c = include '$config'; echo \$c['database']['password'] ?? '';")
+    else
+        echo -e "${RED}錯誤：不支援的網站類型 '$type'${RESET}"
+        return 1
     fi
 
-    # 改用更穩定的 awk 擷取方式
-    db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$config")  
-    db_user=$(awk -F"'" '/DB_USER/{print $4}' "$config")  
-    db_pass=$(awk -F"'" '/DB_PASSWORD/{print $4}' "$config")  
-    
+    if [[ -z "$db_name" || -z "$db_user" || -z "$db_pass" ]]; then
+        echo -e "${RED}錯誤：無法從設定檔中完整讀取資料庫憑證。${RESET}"
+        return 1
+    fi
+    echo -e "${GREEN}成功讀取憑據：資料庫名稱: $db_name, 資料庫使用者: $db_user${RESET}"
 
-    # 檢查網站根目錄是否有 .sql 檔案
-    local sql_files=("$site_path"/*.sql)
-    if [[ ${#sql_files[@]} -gt 0 && -f "${sql_files[0]}" ]]; then
-      backup_file="${sql_files[0]}"
-      echo "發現資料庫備份檔: $backup_file"
-      read -p "是否要自動還原此檔案？[Y/n] " confirm
-      if [[ "$confirm" != [nN] ]]; then
-        echo "開始自動還原..."
-      else
-        backup_file=""
-      fi
+    # --- 步驟 2：檢查並安裝 dba 工具 (如果需要) ---
+    if ! command -v dba >/dev/null 2>&1; then
+        echo "提示：未找到 'dba' 資料庫管理工具，正在嘗試安裝..."
+        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
+        if ! command -v dba >/dev/null 2>&1; then
+            echo -e "${RED}錯誤：'dba' 工具安裝失敗，無法繼續。${RESET}"
+            return 1
+        fi
     fi
 
-  elif [[ "$type" == "flarum" ]]; then
-    local config="$site_path/config.php"
-    if [[ ! -f "$config" ]]; then
-      echo -e "${RED}找不到 config.php${RESET}"
-      return 1
+    local sql_files_in_site_root=("$site_path"/*.sql)
+    if [[ -f "${sql_files_in_site_root[0]}" ]]; then
+        auto_detected_sql_file="${sql_files_in_site_root[0]}"
+        echo -e "${YELLOW}偵測到網站根目錄下存在 SQL 備份檔：$(basename "$auto_detected_sql_file")${RESET}"
+        read -p "是否要立即還原此檔案？[Y/n]: " confirm
+        if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+            auto_detected_sql_file=""
+        fi
     fi
 
-    db_name=$(php -r "
-      \$c = include '$config';
-      echo \$c['database']['database'] ?? '';
-    ")
-    db_user=$(php -r "
-      \$c = include '$config';
-      echo \$c['database']['username'] ?? '';
-    ")
-    db_pass=$(php -r "
-      \$c = include '$config';
-      echo \$c['database']['password'] ?? '';
-    ")
-  else
-    echo -e "${RED}不支援的類型：$type${RESET}"
-    return 1
-  fi
+    # --- 步驟 4：執行還原 ---
+    local import_cmd="dba mysql import"
+    local success=false
 
-  if [[ -z "$db_name" || -z "$db_user" ]]; then
-    echo -e "${RED}無法讀取 DB 設定${RESET}"
-    return 1
-  fi
-
-  if [[ -z "$backup_path" ]]; then
-    read -p "請輸入備份文件夾路徑 ：" backup_path
-    if [[ ! -f "$backup_path" ]]; then
-      echo -e "${RED}文件夾不存在：$backup_path${RESET}"
-      return 1
+    if [[ -n "$auto_detected_sql_file" ]]; then
+        echo "正在使用自動偵測到的檔案進行還原..."
+        if $import_cmd "$auto_detected_sql_file" "$db_name" "$db_user" "$db_pass"; then
+            success=true
+            rm -f "$auto_detected_sql_file"
+        fi
+    else
+        echo "即將啟動 'dba' 工具的互動式選單..."
+        echo "請在選單中選擇您要還原的 SQL 備份檔案。"
+        if $import_cmd "" "$db_name" "$db_user" "$db_pass"; then
+             success=true
+        fi
     fi
-  fi
-  dba mysql import "$backup_path" $db_name $db_user $db_pass
-  echo -e "${GREEN}$type 資料庫 [$db_name] 還原完成${RESET}"
+
+    # --- 步驟 5：報告結果 ---
+    if $success; then
+        echo -e "${GREEN}資料庫還原流程已成功完成。${RESET}"
+    else
+        echo -e "${RED}資料庫還原流程失敗或被取消。${RESET}"
+        return 1
+    fi
 }
 
 set_site_permissions() {
@@ -2945,7 +2961,7 @@ show_cert_status() {
     local i=0
     while [ $i -lt ${#str} ]; do
       local char="${str:$i:1}"
-      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev_null; then
+      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then
         width=$((width + 2))
       else
         width=$((width + 1))
