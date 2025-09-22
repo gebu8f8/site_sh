@@ -6,21 +6,28 @@ if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     exec sudo "$0" "$@"
   else
+    install_sudo_cmd=""
     if command -v apt >/dev/null 2>&1; then
-      apt install sudo -y
+      install_sudo_cmd="apt-get update && apt-get install -y sudo"
     elif command -v yum >/dev/null 2>&1; then
-      yum install sudo -y
+      install_sudo_cmd="yum install -y sudo"
     elif command -v apk >/dev/null 2>&1; then
-      apk add sudo
+      install_sudo_cmd="apk add sudo"
     else
       echo "無sudo指令"
+      sleep 1
       exit 1
+    fi
+    su -c "$install_sudo_cmd"
+    if [ $? -eq 0 ] && command -v sudo >/dev/null 2>&1; then
+      echo "sudo指令已經安裝成功，請等下輸入您的密碼"
+      exec sudo "$0" "$@"
     fi
   fi
 fi
 
 # 版本
-version="7.2.0"
+version="7.2.2"
 
 
 # 顏色定義
