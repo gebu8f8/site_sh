@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.3.0"
+version="7.4.0"
 
 
 # 顏色定義
@@ -2848,12 +2848,27 @@ setup_site() {
 
 show_registered_cas() {
   echo "===== 已註冊憑證機構郵箱如下 ====="
+  local config_file="/ssl_ca/.ssl_ca_emails"
+
+  # 先確保設定檔存在，避免迴圈內重複檢查
+  if [ ! -f "$config_file" ]; then
+    echo "設定檔 $config_file 不存在。"
+    echo "==================================="
+    return 1
+  fi
+
   for ca in letsencrypt zerossl google; do
     email=$(awk -v section="[$ca]" '
+      # 當找到我們正在尋找的區塊時，設定 found=1，然後讀取下一行
       $0 == section { found=1; next }
-      /^.*/ { found=0 }
+      
+      # *** 修正點：使用正確的正則表達式來匹配任何區塊標題 ***
+      # 如果在我們的區塊內讀到下一個區塊標題，就代表我們的區塊結束了
+      /^\[.*\]$/ { found=0 }
+      
+      # 如果 found=1 且該行是以 email= 開頭，就印出值並退出
       found && /^email=/ { print substr($0,7); exit }
-    ' /ssl_ca/.ssl_ca_emails 2>/dev/null)
+    ' "$config_file" 2>/dev/null)
     
     if [ -n "$email" ]; then
       echo "$ca：$email"
@@ -2865,83 +2880,91 @@ show_registered_cas() {
 }
 
 
-select_ca() {
+select_ca() (
   mkdir -p /ssl_ca
   show_registered_cas
   echo "請選擇你要註冊的憑證簽發機構："
   echo "1. Let's Encrypt (預設)"
   echo "2. ZeroSSL"
   echo "3. Google Trust Services"
-  read -rp "選擇 [1-3]: " ca_choice
+  echo "0. 返回"
+  read -rp "選擇 [0-3]: " ca_choice
 
   case "$ca_choice" in
-    2)
-      echo "請先註冊zeroSSL帳號"
-      echo "接著到這個網址生成EAB Credentials for ACME Clients：https://app.zerossl.com/developer"
-      read -p "您的EAB KID：" eab_kid
-      read -p "您的EAB HMAC Key" eab_key
-      read -p "您的郵箱：" zero_email
-      certbot register \
-        --email $zero_email \
-        --no-eff-email \
-        --server "https://acme.zerossl.com/v2/DV90" \
-        --eab-kid "$eab_kid" \
-        --eab-hmac-key "$eab_key"
-      set_ca_email "zerossl" "$zero_email"
-      ;;
-    3)
-      echo "首先你需要有一個google帳號"
-      echo "打開此網址並啟用api，請記得選一個專案：https://console.cloud.google.com/apis/library/publicca.googleapis.com"
-      echo "打開Cloud Shell 並輸入：gcloud beta publicca external-account-keys create"
-      read -p "請輸入keyId：" goog_id
-      read -p "請輸入Key：" goog_eab_key
-      read -p "請輸入您註冊的郵箱" goog_email
-      certbot register \
-        --email "$goog_email" \
-        --no-eff-email \
-        --server "https://dv.acme-v02.api.pki.goog/directory" \
-        --eab-kid "$goog_id" \
-        --eab-hmac-key "$goog_eab_key"
-      set_ca_email "google" "$goog_email"
-      ;;
-    *)
-      read -p "請輸入您的郵箱：" le_email
-      certbot register \
-        --email "$le_email" \
-        --no-eff-email \
-        --server "https://acme-v02.api.letsencrypt.org/directory"
-      set_ca_email "letsencrypt" "$le_email"
-      ;;
+  0)
+    return 0
+    ;;
+  2)
+    echo "請先註冊zeroSSL帳號"
+    echo "接著到這個網址生成EAB Credentials for ACME Clients：https://app.zerossl.com/developer"
+    read -p "您的EAB KID：" eab_kid
+    read -p "您的EAB HMAC Key" eab_key
+    read -p "您的郵箱：" zero_email
+    certbot register \
+      --email $zero_email \
+      --no-eff-email \
+      --agree-tos \
+      --non-interactive \
+      --server "https://acme.zerossl.com/v2/DV90" \
+      --eab-kid "$eab_kid" \
+      --eab-hmac-key "$eab_key"
+    set_ca_email "zerossl" "$zero_email"
+    ;;
+  3)
+    echo "首先你需要有一個google帳號"
+    echo "打開此網址並啟用api，請記得選一個專案：https://console.cloud.google.com/apis/library/publicca.googleapis.com"
+    echo "打開Cloud Shell 並輸入：gcloud beta publicca external-account-keys create"
+    read -p "請輸入keyId：" goog_id
+    read -p "請輸入Key：" goog_eab_key
+    read -p "請輸入您註冊的郵箱" goog_email
+    certbot register \
+      --email "$goog_email" \
+      --no-eff-email \
+      --agree-tos \
+      --non-interactive \
+      --server "https://dv.acme-v02.api.pki.goog/directory" \
+      --eab-kid "$goog_id" \
+      --eab-hmac-key "$goog_eab_key"
+    set_ca_email "google" "$goog_email"
+    ;;
+  *)
+    read -p "請輸入您的郵箱：" le_email
+    certbot register \
+      --email "$le_email" \
+      --no-eff-email \
+      --non-interactive \
+      --agree-tos \
+      --server "https://acme-v02.api.letsencrypt.org/directory"
+    set_ca_email "letsencrypt" "$le_email"
+    ;;
   esac
-}
+)
 set_ca_email() {
+  local ca_name="$1"
+  local email="$2"
+  local config_file="/ssl_ca/.ssl_ca_emails"
+  local temp_file=$(mktemp)
+
   mkdir -p /ssl_ca
-  if [ ! -f /ssl_ca/.ssl_ca_emails ]; then
-  cat > /ssl_ca/.ssl_ca_emails << EOF
-[letsencrypt]
-email=
+  # 確保檔案存在，如果不存在則建立一個空的
+  touch "$config_file"
 
-[zerossl]
-email=
+  # 使用 awk 來安全地移除舊的區塊。
+  # 邏輯：設置一個 'skip' 標記。當遇到目標 [ca_name] 時開始跳過，
+  # 當遇到下一個 [section] 時停止跳過。
+  awk -v ca="[$ca_name]" '
+    BEGIN { skip=0 }
+    $0 == ca { skip=1; next }
+    /^\[.*\]$/ { skip=0 }
+    !skip { print }
+  ' "$config_file" > "$temp_file"
 
-[google]
-email=
-EOF
-  fi
-  local ca_name=$1
-  local email=$2
+  # 將新的 CA 資訊追加到臨時檔案的末尾
+  # 初始模板中所有 email 都為空，所以不需要特殊處理初始情況
+  echo -e "[$ca_name]\nemail=$email\n" >> "$temp_file"
 
-  # 刪除現有的該 CA 的段落，包括郵箱行
-  sed -i "/^\[$ca_name\]$/,/^$/d" /ssl_ca/.ssl_ca_emails 2>/dev/null
-  
-  # 在文件最上方插入新的 CA 段落
-  if [ "$ca_name" == "letsencrypt" ]; then
-    # 如果是letsencrypt，把它插入到文件最前面
-    sed -i "1i[$ca_name]\nemail=$email\n" /ssl_ca/.ssl_ca_emails
-  else
-    # 其他CA，照常追加到文件末尾
-    echo -e "[$ca_name]\nemail=$email\n" >> /ssl_ca/.ssl_ca_emails
-  fi
+  # 用處理過的新檔案覆蓋舊檔案
+  mv "$temp_file" "$config_file"
 }
 
 show_cert_status() {
@@ -3070,7 +3093,7 @@ show_cert_status() {
 
   # --- 階段二：格式化輸出 ---
 
-  # 【關鍵修正2】: 如果沒有任何域名，給出提示並結束
+  # 如果沒有任何域名，給出提示並結束
   if [ ${#data_rows[@]} -eq 0 ]; then
     echo -e "${GREEN}找不到任何設定檔中的域名，或沒有ssl憑證。${RESET}"
     return
@@ -3118,7 +3141,12 @@ show_httpguard_status(){
     return 1
   fi
     local module_name=$1
-    grep -E "^\s*${module_name}\s*=" "$config_file" | grep -oE 'state\s*=\s*"[^"]+"' | head -n1 | grep -oE '"[^"]+"' | tr -d '"'
+    export LANG=en_US.UTF-8
+    export LC_ALL=en_US.UTF-8
+    grep -E "^\s*${module_name}\s*=" "$config_file" | \
+    grep -oE 'state\s*=\s*["'\''][^"'\'']*["'\'']' | \
+    sed -E 's/.*state\s*=\s*["'\''](.*)["'\'']/\1/' | \
+    head -n 1
   }
 
   echo "--- HttpGuard 主動防禦與自動開啟狀態 ---"
@@ -3142,393 +3170,240 @@ show_php() {
   printf "%-20s | %-10s\n" "網址" "備註"
   echo "-------------------------------------------"
 
-  for site_dir in "$wp_root"/*; do
-    if [ -d "$site_dir" ]; then
-      site_name=$(basename "$site_dir")
+  # 使用 find 命令高效地找出所有符合基本條件的候選目錄
+  # -mindepth 1 -maxdepth 1: 只搜尋 /var/www 的下一層，不深入
+  # -type d: 只尋找目錄
+  # -name '*.*': 目錄名稱必須包含 . (初步過濾)
+  # -print0: 使用 NULL 字元分隔結果，處理包含空格等特殊字元的目錄名
+  find "$wp_root" -mindepth 1 -maxdepth 1 -type d -name '*.*' -print0 | \
+  while IFS= read -r -d '' site_dir; do
+    # find 已經幫我們完成了初步篩選，現在只需對候選目錄進行深度檢查
 
-      # 判斷是否為有效網址型資料夾（必須包含 .）
-      if [[ "$site_name" != *.* ]]; then
-        continue
-      fi
-
-      # 必須有 index.php 才處理
-      if [[ ! -f "$site_dir/index.php" ]]; then
-        continue
-      fi
-
-      remark="PHP網站"
-
-      if [[ -f "$site_dir/wp-config.php" ]]; then
-        remark="WordPress"
-      elif [[ -f "$site_dir/public/assets/forum.js" ]] || grep -qi "flarum" "$site_dir/index.php" 2>/dev/null; then
-        remark="Flarum"
-      elif [[ -f "$site_dir/usr/index.php" ]] || grep -qi "Typecho" "$site_dir/index.php" 2>/dev/null; then
-        remark="Typecho"
-      fi
-
-      printf "%-20s | %-10s\n" "$site_name" "$remark"
+    # 必須有 index.php 才處理
+    if [[ ! -f "$site_dir/index.php" ]]; then
+      continue
     fi
+
+    # basename 已不再是瓶頸，可以安全使用
+    local site_name
+    site_name=$(basename "$site_dir")
+    
+    local remark="PHP網站"
+
+    # 應用識別邏輯，這部分是無法避免的檢查，且原始寫法已相當優化 (利用 || 短路特性)
+    if [[ -f "$site_dir/wp-config.php" ]]; then
+      remark="WordPress"
+    elif [[ -f "$site_dir/public/assets/forum.js" ]] || grep -qi "flarum" "$site_dir/index.php" 2>/dev/null; then
+      remark="Flarum"
+    elif [[ -f "$site_dir/usr/index.php" ]] || grep -qi "Typecho" "$site_dir/index.php" 2>/dev/null; then
+      remark="Typecho"
+    fi
+
+    printf "%-20s | %-10s\n" "$site_name" "$remark"
   done
 }
 
-ssl_apply() {
-  check_certbot
+ssl_apply() (
   update_certbot
   mkdir -p /ssl_ca
-  
+
+  # 將常用變數宣告在最前面
   local domains="$1"
+  local selected_ca selected_email server_url auth_method
+  local cred_file reload_cmd
+  local -A ca_emails
+  local -a domain_args certbot_args # 使用陣列來動態建立 certbot 命令
+  local needs_auto_renew=0 # 標記是否需要加入自動續訂
   if [ -z "$domains" ]; then
     read -p "請輸入您的域名（只能用空白鍵分隔）：" domains
   fi
-
-  # 讀取已註冊的 CA email
-  declare -A ca_emails
-  local current_ca=""
+  
+  # 將域名字串轉換為 certbot 的 -d 參數陣列
+  IFS=$' ,\n' read -ra domain_array <<< "$domains"
+  for d in "${domain_array[@]}"; do
+    domain_args+=("-d" "$d")
+  done
+  # (此段邏輯已相當清晰，僅微調)
   local current_ca_config="/ssl_ca/.ssl_ca_emails"
   if [ -f "$current_ca_config" ]; then
+    local current_ca=""
     while IFS="=" read -r key val; do
-      # 檢查是否為新段落
       if [[ $key =~ ^\[(.*)\]$ ]]; then
         current_ca="${BASH_REMATCH[1]}"
-        continue
-      fi
-      # 只有當 current_ca 有值且 email 不為空時才賦值
-      if [[ -n "$current_ca" && $key == "email" && -n "$val" ]]; then
+      elif [[ -n "$current_ca" && $key == "email" && -n "$val" ]]; then
         ca_emails["$current_ca"]="$val"
       fi
     done < "$current_ca_config"
   fi
 
-  echo "偵測到以下已註冊的 CA："
-  ca_options=()
-  index=1
+  local ca_options=()
   for ca in letsencrypt zerossl google; do
-    if [ -n "${ca_emails[$ca]}" ]; then
-      echo "$index) $ca（${ca_emails[$ca]}）"
-      ca_options+=("$ca")
-      ((index++))
-    fi
+    [ -n "${ca_emails[$ca]}" ] && ca_options+=("$ca")
   done
 
   if [ ${#ca_options[@]} -eq 0 ]; then
-    echo "尚未註冊任何憑證簽發機構，直接輸入電子郵件。"
+    echo "尚未註冊任何憑證簽發機構，請直接輸入電子郵件。"
     selected_ca="letsencrypt"
     read -p "請輸入電子郵件：" selected_email
-    certbot register \
-      --email "$selected_email" \
-      --no-eff-email \
-      --server "https://acme-v02.api.letsencrypt.org/directory"
+    certbot register --email "$selected_email" --non-interactive --agree-tos --no-eff-email --server "https://acme-v02.api.letsencrypt.org/directory"
     set_ca_email "letsencrypt" "$selected_email"
-    
   elif [ ${#ca_options[@]} -eq 1 ]; then
-    echo "僅有一個已註冊 CA，將自動選擇：${ca_options[0]}（${ca_emails[${ca_options[0]}]}）"
     selected_ca="${ca_options[0]}"
+    echo "自動選擇已註冊的 CA：$selected_ca（${ca_emails[$selected_ca]}）"
     selected_email="${ca_emails[$selected_ca]}"
   else
+    echo "偵測到以下已註冊的 CA："
+    for i in "${!ca_options[@]}"; do
+      echo "$((i+1))) ${ca_options[$i]}（${ca_emails[${ca_options[$i]}]}）"
+    done
     read -p "請選擇您要使用的 CA [1-${#ca_options[@]}]（預設 1）：" choice
-    choice="${choice:-1}"
     selected_ca="${ca_options[$((choice-1))]}"
     selected_email="${ca_emails[$selected_ca]}"
   fi
-
   case "$selected_ca" in
-    zerossl)
-      server_url="https://acme.zerossl.com/v2/DV90"
-      ;;
+    zerossl) 
+    server_url="https://acme.zerossl.com/v2/DV90"
+    ;;
     google)
-      server_url="https://dv.acme-v02.api.pki.goog/directory"
-      ;;
-    *)
-      server_url="https://acme-v02.api.letsencrypt.org/directory"
-      ;;
+    server_url="https://dv.acme-v02.api.pki.goog/directory"
+    ;;
+    *) 
+    server_url="https://acme-v02.api.letsencrypt.org/directory" 
+    ;;
   esac
-
+  
+  certbot_args=(
+    certonly
+    --email "$selected_email"
+    --agree-tos
+    --key-type rsa
+    --server "$server_url"
+    --non-interactive
+    "${domain_args[@]}"
+  )
+  
   echo "選擇驗證方式："
-  echo "1) DNS (Cloudflare)"
-  echo "2) DNS (其他供應商)"
+  echo "1) DNS (Cloudflare) "
+  echo "2) DNS (其他供應商) "
   echo "3) DNS (CNAME橋接)"
   echo "4) HTTP"
   read -p "選擇 [1-4]（預設 3）:" auth_method
   auth_method="${auth_method:-3}"
 
-  IFS=$' ,\n' read -ra domain_array <<< "$domains"
-  domain_args=()
-  for d in "${domain_array[@]}"; do
-    domain_args+=("-d" "$d")
-  done
-
-  if [ "$auth_method" = 1 ]; then
-    if [ -f "/ssl_ca/cloudflare/cloudflare.ini" ]; then
-      local cred_file="/ssl_ca/cloudflare/cloudflare.ini"
-    else
+  case "$auth_method" in
+  1) # DNS (Cloudflare)
+    cred_file="/ssl_ca/cloudflare/cloudflare.ini"
+    if [ ! -f "$cred_file" ]; then
       mkdir -p /ssl_ca/cloudflare
-      read -s -p "請輸入您的 Cloudflare API Token(非Global API Key)：" cf_token
-      cred_file="/ssl_ca/cloudflare/cloudflare.ini"
+      read -s -p "請輸入您的 Cloudflare API Token (非Global API Key)：" cf_token
       echo "dns_cloudflare_api_token = $cf_token" > "$cred_file"
       chmod 600 "$cred_file"
     fi
-    certbot certonly \
-      --dns-cloudflare \
-      --dns-cloudflare-credentials "$cred_file" \
-      --dns-cloudflare-propagation-seconds 60 \
-      --email "$selected_email" \
-      --key-type rsa \
-      --agree-tos \
-      --server "$server_url" \
-      --non-interactive \
-      "${domain_args[@]}"
-    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-    (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
-    echo "已加入自動續訂任務（每天凌晨3點）"
-
-      # 啟動 crond
-      case $system in
-        1)
-          systemctl enable cron
-          systemctl start cron
-          ;;
-        2)
-          systemctl enable crond
-          systemctl start crond
-          ;;
-        3)
-          rc-update add crond default
-          rc-service crond start
-          ;;
-      esac
-    fi
-  elif [ "$auth_method" = 2 ]; then
-    echo "您好,此DNS不支持自動續訂,是否繼續? (y/n)"
-    read -r continue_choice
-    if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
-      echo "已取消操作。"
-      return 1
-    fi
-    certbot certonly \
-      --manual \
-      --preferred-challenges "dns-01" \
-      --email "$selected_email" \
-      --key-type rsa \
-      --agree-tos \
-      --server "$server_url" \
-      "${domain_args[@]}"
-  elif [ "$auth_method" = 3 ]; then
-    local domain_count=${#domain_array[@]}
+    certbot_args+=(
+      --dns-cloudflare
+      --dns-cloudflare-credentials "$cred_file"
+      --dns-cloudflare-propagation-seconds 60
+    )
+    needs_auto_renew=1
+    ;;
+  2) # DNS (其他供應商)
+    read -p  "此DNS驗證方式不支援自動續訂，是否繼續? (y/n)" continue_choice
+    [[ ! "$continue_choice" =~ ^[Yy]$ ]] && { echo "已取消操作。"; return 1; }
+    local temp_args=()
+    for arg in "${certbot_args[@]}"; do
+      if [[ "$arg" != "--non-interactive" ]]; then
+        temp_args+=("$arg")
+      fi
+    done
+    # 用過濾後的陣列覆蓋原始陣列
+    certbot_args=("${temp_args[@]}")
+    certbot_args+=(--manual --preferred-challenges "dns-01")
+    ;;
+  3) # DNS (CNAME橋接)
     local base_domain=""
-
-    if [ "$domain_count" -eq 1 ]; then
-      # 如果只有一個域名，提取其基礎部分
-      if [[ "${domain_array[0]}" == "*."* ]]; then
-        base_domain="${domain_array[0]:2}"
-      else
-        base_domain="${domain_array[0]}"
-      fi
-    elif [ "$domain_count" -eq 2 ]; then
-      # 如果有兩個域名，進行嚴格的匹配檢查
-      local domain1="${domain_array[0]}"
-      local domain2="${domain_array[1]}"
-
-      # 檢查是否一個是另一個的萬用字元版本 (處理任何順序)
-      if [[ "$domain1" == "*.$domain2" ]] || [[ "$domain2" == "*.$domain1" ]]; then
-        # 提取基礎域名 (永遠是較短的那個)
-        if [ ${#domain1} -lt ${#domain2} ]; then
-          base_domain="$domain1"
-        else
-          base_domain="$domain2"
-        fi
-      else
-        echo -e "${RED}無效的域名組合。${RESET}"
-        echo "             如果您提供兩個域名，它們必須是匹配的根域名和萬用字元域名 (例如: 'example.com *.example.com')。"
-        sleep 2
-        return 1
-      fi
+    if [ "${#domain_array[@]}" -eq 1 ]; then
+      base_domain="${domain_array[0]/\*./}"
+    elif [ "${#domain_array[@]}" -eq 2 ] && [[ "${domain_array[0]}" == "*."*"${domain_array[1]}" || "${domain_array[1]}" == "*."*"${domain_array[0]}" ]]; then
+        base_domain=$([ ${#domain_array[0]} -lt ${#domain_array[1]} ] && echo "${domain_array[0]}" || echo "${domain_array[1]}")
     else
-      echo -e "${RED}域名數量無效。${RESET}"
-      echo "             此模式只支援單一域名或一對匹配的域名。"
-      sleep 1
-      return 1
+      echo -e "${RED}域名數量或組合無效。此模式僅支援單一域名或一對匹配的根域名與萬用字元域名。${RESET}" >&2; return 1
     fi
-    local STATE_FILE="/opt/certbot-hook/certbot_domain.json"
-    if ! [ -f "$STATE_FILE" ]; then
-      echo "{}" > "$STATE_FILE"
-    fi
-    local RANDOM_PART=""
-    while true; do
-      RANDOM_PART="$(head /dev/urandom | tr -dc a-z0-9 | head -c 10)"
-      if ! jq -e --arg prefix "${RANDOM_PART}." '.[] | select(startswith($prefix))' "$STATE_FILE" > /dev/null; then
-        break
-      fi
-    done
-    local cname=""
-    echo "請先新增CNAME: _acme-challenge.$base_domain CNAME $RANDOM_PART.ssl.gebu8f.de"
-    read -p "若新增完成按任意鍵繼續" -n1
-    local success=""
-    success=0
+
+    local RANDOM_PART=$(head /dev/urandom | tr -dc a-z0-9 | head -c 10)
+    local CNAME_TARGET="$RANDOM_PART.ssl.gebu8f.de"
+      
+    echo "請新增 CNAME 記錄: _acme-challenge.$base_domain CNAME $CNAME_TARGET"
+    read -p "新增完成後請按任意鍵繼續..." -n1
+      
+    local success=0
     for i in {1..12}; do
-      echo "第 $i 次檢查中..."
-
-      cname=$(dig +short CNAME "_acme-challenge.$base_domain" @1.1.1.1)
-
-      # 如果 1.1.1.1 查不到，就用 IPv6 DNS 再查
-      if [ -z "$cname" ]; then
-        cname=$(dig +short CNAME "_acme-challenge.$base_domain" @2606:4700:4700::1111)
+      echo -n "第 $i 次檢查中... "
+      cname=$(dig +short CNAME "_acme-challenge.$base_domain" @1.1.1.1 | sed 's/\.$//')
+      if [ "$cname" = "$CNAME_TARGET" ]; then
+        echo -e "${GREEN}驗證成功!${RESET}"; success=1; break
       fi
-
-      # 去掉尾端的點
-      cname=$(echo "$cname" | sed 's/\.$//')
-
-      if [ "$cname" = "$RANDOM_PART.ssl.gebu8f.de" ]; then
-        echo -e "${GREEN}驗證成功: $cname${RESET}"
-        success=1
-        break
-      else
-        sleep 10
-      fi
+      sleep 10
     done
-
-    if [ $success -ne 1 ]; then
-      echo -e "${RED}驗證失敗${RESET}"
-      return 1
-    fi
+    [ $success -ne 1 ] && { echo -e "${RED}驗證失敗。${RESET}" >&2; return 1; }
+      
     mkdir -p "/opt/certbot-hook"
-    if ! [ -f /opt/certbot-hook/cf-hook.sh ]; then
-      wget -q -O /opt/certbot-hook/cf-hook.sh https://files.gebu8f.com/files/cf-hook.sh
-      chmod +x /opt/certbot-hook/cf-hook.sh
+    [ ! -f /opt/certbot-hook/cf-hook.sh ] && wget -q -O /opt/certbot-hook/cf-hook.sh https://files.gebu8f.com/files/cf-hook.sh && chmod +x /opt/certbot-hook/cf-hook.sh
+      
+    certbot_args+=(
+      --manual
+      --preferred-challenges "dns-01"
+      --reuse-key
+      --manual-auth-hook "/opt/certbot-hook/cf-hook.sh add_TXT $CNAME_TARGET"
+      --manual-cleanup-hook "/opt/certbot-hook/cf-hook.sh del_TXT"
+    )
+    needs_auto_renew=1
+    ;;
+  4) # HTTP
+    [[ "$domains" =~ \*\. ]] && echo "HTTP驗證不支援萬用字元域名。" >&2 && sleep 1; return 1
+    if [ "$selected_ca" = "google" ]; then
+      echo "Google CA 不支援 HTTP 驗證。" >&2; return 1
     fi
-    certbot certonly \
-      --manual \
-      --preferred-challenges "dns-01" \
-      --email "$selected_email" \
-      --key-type rsa \
-      --reuse-key \
-      --agree-tos \
-      --server "$server_url" \
-      --manual-auth-hook "/opt/certbot-hook/cf-hook.sh add_TXT $RANDOM_PART.ssl.gebu8f.de" \
-      --manual-cleanup-hook "/opt/certbot-hook/cf-hook.sh del_TXT" \
-      "${domain_args[@]}"
-    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-      (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
-      echo "已加入自動續訂任務（每天凌晨3點）"
-
-      # 啟動 crond
-      case $system in
-      1)
-        systemctl enable cron
-        systemctl start cron
-        ;;
-      2)
-        systemctl enable crond
-        systemctl start crond
-        ;;
-      3)
-        rc-update add crond default
-        rc-service crond start
-        ;;
-      esac
-    fi
-  else
-    if [[ "$domains" =~ \*\. ]]; then
-      echo "您好,HTTP驗證不能使用泛域名"
-    return 1
-    fi
-    if [ "$selected_ca" = "google" ] && [ "$auth_method" = "3" ]; then
-      echo "錯誤：Google CA 不支援 HTTP 驗證，請選擇 DNS 驗證方式（選項 1 或 2）"
-      return 1
-    fi
-    clean_ssl_session_cache
+    [ ! -f /opt/certbot-hook/open_port.sh ] && wget -q -O /opt/certbot-hook/open_port.sh https://gitlab.com/gebu8f/sh/-/raw/main/nginx/open_port.sh && chmod +x /opt/certbot-hook/open_port.sh
+      /opt/certbot-hook/open_port.sh add 80
     local detect_conf_path=$(detect_conf_path)
-  
-  
-    # 建立 open_port.sh
-    cat > /ssl_ca/open_port.sh <<'EOF'
-#!/bin/bash
-firewall=0
-if command -v ufw >/dev/null 2>&1; then
-  firewall=1
-elif command -v iptables >/dev/null 2>&1 && ! command -v ufw >/dev/null 2>&1; then
-  firewall=2
-elif command -v firewall-cmd >/dev/null 2>&1; then
-  firewall=3
-fi
-
-action="$1"
-port="${2:-80}"
-
-if [ "$firewall" -eq 1 ]; then
-  if [ "$action" = "add" ]; then
-    ufw status | grep -qw "$port" || ufw allow "$port"
-  else
-    ufw delete allow "$port" >/dev/null 2>&1 || true
-  fi
-elif [ "$firewall" -eq 2 ]; then
-  if [ "$action" = "add" ]; then
-    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-  else
-    iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-  fi
-elif [ "$firewall" -eq 3 ]; then
-  if [ "$action" = "add" ]; then
-    firewall-cmd --quiet --add-port="$port"/tcp || true
-  else
-    firewall-cmd --quiet --remove-port="$port"/tcp || true
-  fi
-fi
-EOF
-    chmod +x /ssl_ca/open_port.sh
-    /ssl_ca/open_port.sh add 80
     mkdir -p /var/www/acme
-    wget -O $detect_conf_path/acme.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_http.conf
-    sed -i "s|domain|$domains|g" $detect_conf_path/acme.conf
+    wget -O "$detect_conf_path/acme.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_http.conf
+    sed -i "s|domain|$domains|g" "$detect_conf_path/acme.conf"
     restart_nginx_openresty
-    certbot certonly  \
-      --webroot \
-      --webroot-path /var/www/acme \
-      --email "$selected_email" \
-      --agree-tos \
-      --key-type rsa \
-      --server "$server_url" \
-      --non-interactive \
-      "${domain_args[@]}"
-    rm $detect_conf_path/acme.conf
-    /ssl_ca/open_port.sh del 80
-    restart_nginx_openresty
-    mkdir -p /ssl_ca/hooks
-    cat > /ssl_ca/hooks/certbot_pre.sh <<'EOF'
-#!/bin/bash
-/ssl_ca/open_port.sh add 80
-EOF
-    cat > /ssl_ca/hooks/certbot_post.sh <<EOF
-#!/bin/bash
-/ssl_ca/open_port.sh del 80
-$reload_cmd
-EOF
-    chmod +x /ssl_ca/hooks/certbot_*.sh
-    (crontab -l 2>/dev/null | grep -v 'certbot renew'; echo '0 3 * * * certbot renew --quiet --pre-hook "/ssl_ca/hooks/certbot_pre.sh" --post-hook "/ssl_ca/hooks/certbot_post.sh"') | crontab -
-    echo "已加入自動續訂任務（每天凌晨3點）"
-
-      # 啟動 crond
-      case $system in
-        1)
-          systemctl enable cron
-          systemctl start cron
-          ;;
-        2)
-          systemctl enable crond
-          systemctl start crond
-          ;;
-        3)
-          rc-update add crond default
-          rc-service crond start
-          ;;
-      esac
+    certbot_args+=(--webroot --webroot-path /var/www/acme)
+    # 執行後的清理工作
+    trap 'rm -f "$detect_conf_path/acme.conf"; /opt/certbot-hook/open_port.sh del 80; restart_nginx_openresty' RETURN
+    needs_auto_renew=2
+    ;;
+  *)
+    echo "無效的選擇。" >&2
+    return 1
+    ;;
+  esac
+  if ! certbot "${certbot_args[@]}"; then
+    echo "${RED}SSL 憑證申請失敗。${RESET}" >&2
+    return 1
   fi
-
-  if [ "$system" -eq 3 ]; then
-    reload_cmd="service nginx restart"
-  else
-    reload_cmd="systemctl reload nginx || true"
+  echo "${GREEN}SSL 憑證申請成功！${RESET}"
+  if [ "$needs_auto_renew" -gt 0 ]; then
+    local cron_command="certbot renew --quiet"
+    if [ "$needs_auto_renew" -eq 2 ]; then # 處理 HTTP 驗證的 hook
+      mkdir -p /opt/certbot-hook
+      [ ! -f /opt/certbot-hook/certbot_post.sh] && wget -q -O /opt/certbot-hook/certbot_post.sh https://gitlab.com/gebu8f/sh/-/raw/main/nginx/certbot_post.sh && chmod +x /opt/certbot-hook/certbot_post.sh
+      cron_command+=" --pre-hook \"/opt/certbot-hook/certbot_post.sh add\" --post-hook \"/opt/certbot-hook/certbot_post.sh del\""
+    fi
+    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+      (crontab -l 2>/dev/null; echo "0 3 * * * $cron_command") | crontab -
+      echo "已加入自動續訂任務。"
+    fi
+    # 啟用 crond 服務
+    case $system in
+      1) systemctl enable --now cron ;;
+      2) systemctl enable --now crond ;;
+      3) rc-update add crond default && rc-service crond start ;;
+    esac
   fi
-}
+)
 
 toggle_httpguard_module() {
   local module_name=$1
