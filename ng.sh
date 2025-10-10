@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.4.0"
+version="7.4.1"
 
 
 # 顏色定義
@@ -2967,165 +2967,175 @@ set_ca_email() {
   mv "$temp_file" "$config_file"
 }
 
-show_cert_status() {
+show_cert_status() (
+  # 在子 Shell 中執行
   check_web_environment
   if [[ $use_my_app != true ]]; then
     echo -e "===== Nginx 站點憑證狀態 ====="
     echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
-    return
+    return 0
   fi
 
   echo -e "===== Nginx 站點憑證狀態 ====="
 
-  # --- 通用排版輔助函式 (已驗證其穩健性) ---
-  display_width() {
-    local str="$1"
-    local width=0
-    local i=0
-    while [ $i -lt ${#str} ]; do
-      local char="${str:$i:1}"
-      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then
-        width=$((width + 2))
-      else
-        width=$((width + 1))
-      fi
-      i=$((i + 1))
-    done
-    echo $width
-  }
-
-  pad_left() {
-    local text="$1"
-    local max_width="$2"
-    local current_width=$(display_width "$text")
-    local padding=$((max_width - current_width))
-    printf "%s%*s" "$text" $padding ""
-  }
-
-  local CERT_PATH="/etc/letsencrypt/live"
-  
   if (( BASH_VERSINFO[0] < 4 )); then
       echo "錯誤：此腳本需要 Bash 4.0 或更高版本才能使用關聯陣列。" >&2
       return 1
   fi
 
-  # --- 效能核心：建立憑證資訊快取 (邏輯不變) ---
-  declare -A san_to_cert
-  declare -A wildcard_certs
-  declare -A cert_expiry_dates
-  declare -A cert_notes
-  
-  for cert_dir in "$CERT_PATH"/*; do
-    [[ -d "$cert_dir" ]] || continue
-    local cert_file="$cert_dir/fullchain.pem" # 修正：Let's Encrypt 建議使用 fullchain.pem
-    [[ -f "$cert_file" ]] || continue
-
-    local cert_name=$(basename "$cert_dir")
-    local cert_info=$(openssl x509 -in "$cert_file" -noout -text -enddate 2>/dev/null)
-    if [[ -z "$cert_info" ]]; then continue; fi
-
-    local end_date_raw=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
-    local end_date=$([[ -n "$end_date_raw" ]] && echo "$end_date_raw" | awk '{print $1, $2, $4, $5}' || echo "無效日期")
-    cert_expiry_dates["$cert_name"]="$end_date"
-
-    if [[ -f "$cert_dir/cf_cert_id.txt" ]]; then
-      cert_notes["$cert_name"]="CF Origin"
-    fi
-
-    local san_list=$(echo "$cert_info" | awk '/X509v3 Subject Alternative Name/ {getline; gsub("DNS:", ""); gsub(", ", "\n"); print}')
-    for san in $san_list; do
-      if [[ "$san" == \*.* ]]; then
-        wildcard_certs["${san#*.}"]="$cert_name"
-      else
-        san_to_cert["$san"]="$cert_name"
-      fi
-    done
-  done
-  # --- 快取建立完成 ---
+  # --- 快取相關設定 ---
+  local CACHE_DIR="/var/cache/site_manager"
+  local NGINX_CACHE_FILE="$CACHE_DIR/nginx_domains.cache"
+  mkdir -p "$CACHE_DIR"
 
   local nginx_conf_paths=$(detect_conf_path)
-  local nginx_domains=$(grep -rhoE 'server_name\s+[^;]+' "$nginx_conf_paths" 2>/dev/null | \
-    sed -E 's/server_name\s+//' | tr ' ' '\n' | grep -E '^[a-zA-Z0-9.-]+$' | sort -u)
 
-  # --- 修正核心：採用更穩健的兩段式渲染邏輯 ---
+  # --- 1. Nginx 配置解析 (帶智慧快取) ---
+  declare -A domain_to_cert_path
 
-  # --- 階段一：收集數據並計算各欄位最大寬度 ---
-  local headers=("域名" "到期日" "憑證資料夾" "狀態" "備註")
-  local -a max_widths=()
-  # 【關鍵修正1】: 動態計算標題的初始寬度，不再硬編碼
-  for header in "${headers[@]}"; do
-    max_widths+=($(display_width "$header"))
+  local nginx_last_mod=0
+  [ -d "$nginx_conf_paths" ] && nginx_last_mod=$(stat -c %Y "$nginx_conf_paths")
+  local cache_last_mod=0
+  [ -f "$NGINX_CACHE_FILE" ] && cache_last_mod=$(stat -c %Y "$NGINX_CACHE_FILE")
+
+  if (( cache_last_mod > nginx_last_mod )); then
+    while IFS='|' read -r domain cert_path; do
+      domain_to_cert_path["$domain"]="$cert_path"
+    done < "$NGINX_CACHE_FILE"
+  else
+    local server_configs
+    server_configs=$(awk '/server_name/,/ssl_certificate /' "$nginx_conf_paths"/*.conf 2>/dev/null | grep -E "server_name|ssl_certificate ")
+
+    local current_domains=""
+    > "$NGINX_CACHE_FILE"
+    
+    while IFS= read -r line; do
+      if [[ $line =~ server_name ]]; then
+        current_domains=$(echo "$line" | sed -e 's/server_name//' -e 's/;//' | xargs)
+      elif [[ $line =~ ssl_certificate && -n "$current_domains" ]]; then
+        local cert_path
+        cert_path=$(echo "$line" | awk '{print $2}' | sed 's/;//')
+        for domain in $current_domains; do
+          if [[ "$cert_path" == /etc/letsencrypt/live/* ]]; then
+            domain_to_cert_path["$domain"]="$cert_path"
+            echo "$domain|$cert_path" >> "$NGINX_CACHE_FILE"
+          fi
+        done
+        current_domains=""
+      fi
+    done <<< "$server_configs"
+  fi
+
+  # --- 2. 處理憑證資訊 (帶記憶體內 openssl 快取) ---
+  declare -A cert_cache 
+  declare -A domain_data
+
+  local nginx_domains
+  mapfile -t nginx_domains < <(printf "%s\n" "${!domain_to_cert_path[@]}" | sort -u)
+
+  if [ ${#nginx_domains[@]} -eq 0 ]; then
+    echo -e "${GREEN}找不到任何設定了 SSL 憑證的域名。${RESET}"
+    return 0
+  fi
+
+  for domain in "${nginx_domains[@]}"; do
+    local cert_path="${domain_to_cert_path[$domain]}"
+    local cert_name=$(basename "$(dirname "$cert_path")")
+    local note=""
+    local end_date=""
+
+    if [[ -n "${cert_cache[$cert_path]}" ]]; then
+      IFS='|' read -r end_date note <<< "${cert_cache[$cert_path]}"
+    else
+      if [[ -f "$cert_path" ]]; then
+        # *** 核心修改：一次 openssl 呼叫獲取所有需要的資訊 ***
+        local cert_info
+        cert_info=$(openssl x509 -in "$cert_path" -noout -enddate -issuer 2>/dev/null)
+        
+        if [[ -n "$cert_info" ]]; then
+          local end_date_raw=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
+          end_date=$([[ -n "$end_date_raw" ]] && date -d "$end_date_raw" +"%Y-%m-%d" || echo "無效日期")
+          
+          # *** 新增功能：檢查簽發者 ***
+          local issuer
+          issuer=$(echo "$cert_info" | grep 'issuer' | sed 's/issuer=//')
+          if [[ ${issuer,,} == *cloudflare* ]]; then # <-- 轉小寫後比較
+            note="CF 原始憑證"
+          fi
+
+          # 舊的備註邏輯可以保留，例如用於非 CF Origin 的其他備註
+          # if [[ -z "$note" ]]; then
+          #   ... 其他備註邏輯 ...
+          # fi
+          
+          cert_cache["$cert_path"]="$end_date|$note"
+        else
+          end_date="讀取失敗"
+        fi
+      else
+        end_date="檔案不存在"
+      fi
+      [[ -z "${cert_cache[$cert_path]}" ]] && cert_cache["$cert_path"]="$end_date|$note"
+    fi
+    domain_data["$domain"]="$end_date|$cert_name|$note"
   done
 
-  local data_rows=()
-  for nginx_domain in $nginx_domains; do
-    local matched_cert="-"
-    local end_date="無憑證"
-    local status="未使用/錯誤"
-    local note=""
+  # --- 3. 渲染輸出 (與上一版完全相同，無需修改) ---
+  
+  # --- 排版輔助函式 ---
+  display_width() {
+    local str="$1"; local width=0; local i=0
+    while [ $i -lt ${#str} ]; do
+      local char="${str:$i:1}"
+      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then width=$((width + 2)); else width=$((width + 1)); fi
+      i=$((i + 1)); done; echo $width
+  }
+  pad_left() {
+    local text="$1"; local max_width="$2"
+    local current_width=$(display_width "$text"); local padding=$((max_width - current_width))
+    printf "%s%*s" "$text" $padding ""
+  }
 
-    if [[ -n "${san_to_cert[$nginx_domain]}" ]]; then
-      matched_cert="${san_to_cert[$nginx_domain]}"
-      status="是"
-    else
-      local base_domain="${nginx_domain#*.}"
-      if [[ "$base_domain" != "$nginx_domain" && -n "${wildcard_certs[$base_domain]}" ]]; then
-        matched_cert="${wildcard_certs[$base_domain]}"
-        status="泛域名命中"
-      fi
-    fi
+  # --- 階段一：收集數據並計算各欄位最大寬度 ---
+  local headers=("域名" "到期日" "憑證資料夾" "備註")
+  local -a max_widths=()
+  for header in "${headers[@]}"; do max_widths+=($(display_width "$header")); done
 
-    if [[ "$matched_cert" != "-" ]]; then
-      end_date="${cert_expiry_dates[$matched_cert]:-無效日期}"
-      note="${cert_notes[$matched_cert]}"
+  local -a data_rows
+  for domain in "${nginx_domains[@]}"; do
+    IFS='|' read -r end_date cert_name note <<< "${domain_data[$domain]}"
+    if [ -z "$end_date" ]; then
+      end_date="無憑證"; cert_name="-"; note=""
     fi
-    
-    data_rows+=("$nginx_domain|$end_date|$matched_cert|$status|$note")
-    
-    local -a current_row_data=("$nginx_domain" "$end_date" "$matched_cert" "$status" "$note")
+    data_rows+=("$domain|$end_date|$cert_name|$note")
+    local -a current_row_data=("$domain" "$end_date" "$cert_name" "$note")
     for i in "${!max_widths[@]}"; do
-      local current_width=$(display_width "${current_row_data[$i]}")
-      if [[ $current_width -gt ${max_widths[$i]} ]]; then
-        max_widths[$i]=$current_width
-      fi
+      local current_width=$(display_width "${current_row_data[$i]}");
+      if [[ $current_width -gt ${max_widths[$i]} ]]; then max_widths[$i]=$current_width; fi
     done
   done
 
   # --- 階段二：格式化輸出 ---
-
-  # 如果沒有任何域名，給出提示並結束
-  if [ ${#data_rows[@]} -eq 0 ]; then
-    echo -e "${GREEN}找不到任何設定檔中的域名，或沒有ssl憑證。${RESET}"
-    return
-  fi
-
-  # 輸出表頭
   for i in "${!headers[@]}"; do
-    pad_left "${headers[$i]}" "${max_widths[$i]}"
-    # 最後一欄不加空格
-    if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " "; fi
-  done
-  printf "\n"
+    pad_left "${headers[$i]}" "${max_widths[$i]}";
+    if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " | "; fi;
+  done; printf "\n"
 
-  # 輸出分隔線
-  total_width=0
-  for width in "${max_widths[@]}"; do
-    total_width=$((total_width + width))
-  done
-  total_width=$((total_width + ${#max_widths[@]} - 1))
-  printf '%.0s-' $(seq 1 $total_width) && printf "\n"
+  local total_width=0
+  for i in "${!max_widths[@]}"; do
+    total_width=$((total_width + max_widths[i]));
+    if [[ $i -lt $((${#headers[@]} - 1)) ]]; then total_width=$((total_width + 3)); fi;
+  done; printf '%.0s-' $(seq 1 $total_width); printf "\n"
 
-  # 輸出數據行
   for row in "${data_rows[@]}"; do
-    IFS='|' read -r domain date cert status note <<< "$row"
-    local -a fields=("$domain" "$date" "$cert" "$status" "$note")
+    IFS='|' read -r domain date cert note <<< "$row"
+    local -a fields=("$domain" "$date" "$cert" "$note")
     for i in "${!fields[@]}"; do
-      pad_left "${fields[$i]}" "${max_widths[$i]}"
-      if [[ $i -lt $((${#fields[@]} - 1)) ]]; then printf " "; fi
-    done
-    printf "\n"
+      pad_left "${fields[$i]}" "${max_widths[$i]}";
+      if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " | "; fi;
+    done; printf "\n"
   done
-}
+)
 
 
 show_httpguard_status(){
