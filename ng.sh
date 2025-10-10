@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.4.1"
+version="7.4.3"
 
 
 # 顏色定義
@@ -1179,6 +1179,24 @@ detect_conf_path() {
   fi
   
   mkdir -p "$default_conf_dir"
+  
+  # 檢查 nginx.conf 的 http 區塊中是否已有此 include 語句
+  if ! grep -qE "include[[:space:]]+${default_conf_dir}/\*\.conf;" "$nginx_conf"; then
+    
+    # 在 http 區塊的結尾（最後一個 } 之前）插入 include 語句
+    sed -i "/^http[[:space:]]*{/,/^}/ {
+      /^}/i\\    include ${default_conf_dir}/*.conf;
+    }" "$nginx_conf" 2>/dev/null
+    
+    # 測試配置並重啟
+    if command -v openresty >/dev/null 2>&1; then
+      openresty -t >/dev/null 2>&1 && service openresty restart >/dev/null 2>&1
+    elif command -v nginx >/dev/null 2>&1; then
+      nginx -t >/dev/null 2>&1 && service nginx restart >/dev/null 2>&1
+    fi
+
+  fi
+  
   echo "$default_conf_dir"
 }
 detect_sites() {
@@ -1608,7 +1626,7 @@ html_sites(){
   setup_site "$domain" html
   echo "已建立 $domain 之html站點。"
 }
-httpguard_setup(){
+httpguard_setup()(
   check_php
   case $system in
   1|2)
@@ -1708,7 +1726,7 @@ httpguard_setup(){
     echo "安裝失敗.."
     return 1
   fi
-}
+)
 
 install_wp_plugin_with_search_or_url() {
   local domain="$1"
