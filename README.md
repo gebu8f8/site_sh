@@ -76,7 +76,7 @@ https://github.com/gebu8f8/docker_sh
 
 ## 安裝與使用
 ```
-bash <(curl -sL https://raw.githubusercontent.com/gebu8f8/site_sh/refs/heads/main/install.sh)
+bash <(curl -sL https://sh.gebu8f.com/site)
 ```
 之後即可用site使用之
 
