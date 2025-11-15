@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.4.3"
+version="7.4.4"
 
 
 # 顏色定義
@@ -1829,6 +1829,9 @@ install_web_server(){
       apt install -y curl gnupg2 ca-certificates lsb-release
       curl -s https://openresty.org/package/pubkey.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/openresty.gpg
       if [[ $os == "debian" ]]; then
+        if [[ $codename == "trixie" ]]; then
+          codename="bookworm"
+        fi
         echo "deb https://openresty.org/package/debian $codename openresty" | tee /etc/apt/sources.list.d/openresty.list
       elif [[ $os == "kali" ]]; then
         codename="bookworm"
@@ -3409,10 +3412,10 @@ ssl_apply() (
     ;;
   esac
   if ! certbot "${certbot_args[@]}"; then
-    echo "${RED}SSL 憑證申請失敗。${RESET}" >&2
+    echo -e "${RED}SSL 憑證申請失敗。${RESET}" >&2
     return 1
   fi
-  echo "${GREEN}SSL 憑證申請成功！${RESET}"
+  echo -e "${GREEN}SSL 憑證申請成功！${RESET}"
   if [ "$needs_auto_renew" -gt 0 ]; then
     local cron_command="certbot renew --quiet"
     if [ "$needs_auto_renew" -eq 2 ]; then # 處理 HTTP 驗證的 hook
