@@ -79,14 +79,3 @@ https://github.com/gebu8f8/docker_sh
 bash <(curl -sL https://sh.gebu8f.com/site)
 ```
 之後即可用site使用之
-
----
-💡 **支持本計畫**
-
-如果你覺得這個工具幫助到你了，  
-也歡迎在下方自願性支持我繼續開源維護：
-
-→ [前往支持頁面](https://ko-fi.com/gebu8f)
-
-我沒有強制贊助，也不會推廣付費功能。  
-因為我相信：**願意支持的你，一定會自己找到這段話。**
