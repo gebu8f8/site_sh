@@ -9,7 +9,7 @@ if [ "$(id -u)" -ne 0 ]; then
     install_sudo_cmd=""
     if command -v apt >/dev/null 2>&1; then
       install_sudo_cmd="apt-get update && apt-get install -y sudo"
-    elif command -v yum >/dev/null 2>&1; then
+    elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
       install_sudo_cmd="yum install -y sudo"
     elif command -v apk >/dev/null 2>&1; then
       install_sudo_cmd="apk add sudo"
@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="7.4.4"
+version="8.0.0"
 
 
 # 顏色定義
@@ -38,73 +38,224 @@ CYAN="\033[1;36m"    # ℹ️ 一般提示用青色
 RESET='\033[0m'      # 清除顏色
 
 
-
-adjust_opcache_settings() {
-  local php_var
-  php_var=$(check_php_version)
-  local system=$1  # 1 表示 Debian/Ubuntu
-
+phpini_path()(
+  local php_var=$(check_php_version)
   local php_ini
   if [ "$system" -eq 1 ]; then
     php_ini="/etc/php/$php_var/fpm/php.ini"
   else
     php_ini=$(php -i | grep "Loaded Configuration File" | awk '{print $5}')
   fi
+  echo $php_ini
+)
 
-  if [ ! -f "$php_ini" ]; then
-    echo -e "${RED}無法找到 php.ini，無法調整 opcache 設定。${RESET}"
+check_system(){
+  if command -v apt >/dev/null 2>&1; then
+    system=1
+  elif command -v yum >/dev/null 2>&1; then
+    system=2
+    if grep -q -Ei "release 7|release 8" /etc/redhat-release; then
+      echo -e "${RED}不支援 CentOS 7 或 CentOS 8，請升級至 9 系列 (Rocky/Alma/CentOS Stream)${RESET}"
+      exit 1
+    fi
+  elif command -v apk >/dev/null 2>&1; then
+    system=3
+   else
+    echo -e "${RED}不支援的系統。${RESET}" >&2
+    exit 1
+  fi
+}
+
+check_and_start_service() {
+  if command -v openresty >/dev/null 2>&1; then
+    local service_name=openresty
+  elif command -v nginx >/dev/null 2>&1; then
+    local service_name=nginx
+  fi
+
+  if service "$service_name" status >/dev/null 2>&1; then
+    service "$service_name" start
+  fi
+}
+
+check_web_environment() {
+  use_my_app=false
+  port_in_use=false
+  ss -tln | grep -qE ':(80|443)\s' && port_in_use=true
+  # 有安裝 nginx 或 openresty 即可啟用
+  if command -v nginx >/dev/null 2>&1 || command -v openresty >/dev/null 2>&1 || command -v caddy >/dev/null 2>&1; then
+    use_my_app=true
+  fi
+}
+
+check_cert() {
+  local domain="$1"
+  local cert_dir="/etc/letsencrypt/live"
+  
+  [ $caddy -eq 1 ] && return 0
+
+  # 計算網域層級
+  IFS='.' read -ra domain_parts <<< "$domain"
+  local level=${#domain_parts[@]}
+
+  if [ "$level" -ge 6 ]; then
+    echo -e ${RED} "網域層級過多（$level），請檢查輸入是否正確。${RESET}" >&2
     return 1
   fi
 
-  # 檢查並處理 opcache.revalidate_freq
-  if grep -qE '^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=' "$php_ini"; then
-    # 提取值
-    local current_revalidate_freq
-    current_revalidate_freq=$(grep -E '^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=' "$php_ini" | \
-      awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')
+  # 掃描所有憑證資料夾，逐一分析 SAN
+  for dir in "$cert_dir"/*; do
+    [ -d "$dir" ] || continue
+    local cert_path="$dir/fullchain.pem"
 
-    if [ "$current_revalidate_freq" = "0" ]; then
-      echo -e "${CYAN}調整 opcache.revalidate_freq 為 1${RESET}"
-      sed -i 's/^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=.*/opcache.revalidate_freq=1/' "$php_ini"
-    else
-      echo -e "${CYAN}opcache.revalidate_freq 值不是 0，無需修改${RESET}"
+    if [ -f "$cert_path" ]; then
+      local san_list=$(openssl x509 -in "$cert_path" -noout -ext subjectAltName 2>/dev/null | \
+        grep -oE 'DNS:[^,]+' | sed 's/DNS://g')
+
+      for san in $san_list; do
+        if [[ "$san" == "$domain" ]] || [[ "$san" == "*.${domain#*.}" ]]; then
+          echo "$(basename "$dir")"
+          return 0
+        fi
+      done
     fi
-  else
-    echo -e "${CYAN}opcache.revalidate_freq 未在 php.ini 中設定或僅存在註解，跳過修改${RESET}"
-  fi
+  done
 
-  # 檢查並處理 opcache.validate_timestamps
-  if grep -qE '^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=' "$php_ini"; then
-    # 提取值
-    local current_validate_timestamps
-    current_validate_timestamps=$(grep -E '^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=' "$php_ini" | \
-      awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')
-
-    if [ "$current_validate_timestamps" = "0" ]; then
-      echo -e "${GREEN} 調整 opcache.validate_timestamps 為 2${RESET}"
-      sed -i 's/^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=.*/opcache.validate_timestamps=2/' "$php_ini"
-    else
-      echo -e "${CYAN}opcache.validate_timestamps 值不是 0，無需修改${RESET}"
-    fi
-  else
-    echo -e "${CYAN}opcache.validate_timestamps 未在 php.ini 中設定或僅存在註解，跳過修改${RESET}"
-  fi
-
-  echo "${GREEN} 檢查完成${RESET}"
+  echo -e "${YELLOW}未找到包含 $domain 的有效憑證${RESET}" >&2
+  return 1
 }
+
+check_app(){
+  declare -A pkg_map=(
+    ["wget"]="wget"
+    ["jq"]="jq"
+    ["nano"]="nano"
+    ["ss"]="iproute2"
+    ["openssl"]="openssl"
+  )
+  if [ $system -eq 2 ]; then
+    if ! [ -f /etc/fedora-release ]; then
+      if ! yum repolist enabled | grep -q "epel"; then
+        yum install -y epel-release
+      fi
+    fi
+  fi
+  for cmd in "${!pkg_map[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      pkg="${pkg_map[$cmd]}"
+      case "$system" in
+      1) apt update -qq && apt install -y "$pkg" ;;
+      2) yum update && yum install -y "$pkg" ;;
+      esac
+    fi
+  done
+  if ! command -v lsb_release &>/dev/null; then
+    case $system in
+    1)
+      apt update && apt install -y lsb-release
+      ;;
+    2)
+      dnf install -y lsb-release
+      ;;
+    esac
+  fi
+  if ! command -v dig &>/dev/null; then
+    case $system in
+    1)
+      apt update && apt install -y dnsutils
+      ;;
+    2)
+      yum install -y bind-utils
+      ;;
+    3)
+      apk add bind-tools
+      ;;
+    esac
+  fi
+}
+
+check_webserver_install(){
+  if [[ $use_my_app = false && $port_in_use = false ]]; then
+    while true; do
+      clear
+      echo "=========站點管理器之安裝網站伺服器=========="
+      echo "1. 安裝nginx（支援HTTP3）"
+      echo "2. 安裝Openresy（支援LUA）"
+      echo "3. 安裝caddy server (個人站適用)"
+      read -p "請選擇安裝的伺服器[1-3，預設為2]" choice
+      choice=${choice:-2}
+      case $choice in
+      1)
+        install_web_server nginx 
+        break
+        ;;
+      2)
+        if [ $system == 1 ]; then
+          local codename
+          local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          if [[ $os == kali ]]; then
+            codename=bookworm
+          else
+            codename=$(grep -Po 'VERSION="[0-9]+ \(\K[^)]+' /etc/os-release)
+            local codename_ver=$(grep -Po '(?<=VERSION_ID=")[0-9]+' /etc/os-release)
+          fi
+          if [ $codename_ver -gt 12 ]; then
+            codename=bookworm
+          fi
+          if ! curl -sf "https://openresty.org/package/debian/dists/${codename}/" >/dev/null; then
+            echo -e "${RED}官方倉庫尚未支援 ${codename}${RESET}"
+            sleep 2
+          else
+            install_web_server openresty
+            break
+          fi
+        elif [ $system == 3 ]; then
+          if curl -sf https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main >/dev/null; then
+            install_web_server openresty
+          else
+            install_web_server openresty compile
+            break
+          fi
+        fi
+        ;;
+      3)
+        if [ $system -eq 3 ]; then
+          echo -e "
+          ${YELLOW}官方倉庫尚未支援${RESET}"
+          sleep 1
+        fi
+        install_web_server caddy
+        break
+      esac
+    done
+  fi
+}
+
+check_web_server(){
+  openresty=0
+  nginx=0
+  caddy=0
+  if command -v openresty >/dev/null 2>&1; then
+    openresty=1
+  elif command -v nginx >/dev/null 2>&1; then
+    nginx=1
+  elif command -v caddy >/dev/null 2>&1; then
+    caddy=1
+  fi
+}
+
 # WordPress備份
-# 自動偵測站點類型
 # 回傳 wp/flarum/unknown
 
 detect_site_type() {
-    local web_root="$1"
-    if [[ -f "$web_root/wp-config.php" ]]; then
-        echo "wp"
-    elif [[ -f "$web_root/config.php" && -d "$web_root/vendor/flarum" ]]; then
-        echo "flarum"
-    else
-        echo "unknown"
-    fi
+  local web_root="$1"
+  if [[ -f "$web_root/wp-config.php" ]]; then
+    echo "wp"
+  elif [[ -f "$web_root/config.php" && -d "$web_root/vendor/flarum" ]]; then
+    echo "flarum"
+  else
+    echo "unknown"
+  fi
 }
 
 # 多站型清除備份主函式，$1=wp/flarum，$2=domain，$3=保留份數
@@ -129,106 +280,80 @@ backup_site_type_clean() {
 
 # 多站型備份主函式，$1=wp/flarum，$2=domain
 backup_site_type() {
-    local type="$1"
-    local domain="$2"
-    local web_root="/var/www/$domain"
-    local backup_dir="/opt/wp_backups/$domain"
-    local timestamp=$(date +"%Y%m%d-%H%M%S")
-    local backup_file="$backup_dir/backup-$timestamp.tar.gz"
-    mkdir -p "$backup_dir"
+  local type="$1"
+  local domain="$2"
+  local web_root="/var/www/$domain"
+  local backup_dir="/opt/wp_backups/$domain"
+  local timestamp=$(date +"%Y%m%d-%H%M%S")
+  local backup_file="$backup_dir/backup-$timestamp.tar.gz"
+  mkdir -p "$backup_dir"
 
-    # --- 資料庫備份 (DB Backup) ---
-    local db_name=""
-    local dba_export_dir="/root/mysql_backups"
+  # --- 資料庫備份 (DB Backup) ---
+  local db_name=""
+  local dba_export_dir="/root/mysql_backups"
 
-    echo "正在偵測資料庫設定..."
-
-    if [[ "$type" == "wp" ]]; then
-        local wp_config="$web_root/wp-config.php"
-        db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$wp_config")
-    elif [[ "$type" == "flarum" ]]; then
-        local config="$web_root/config.php"
-        if [[ ! -f "$config" ]]; then
-            echo -e "${RED}找不到 config.php${RESET}"
-            return 1
-        fi
-        db_name=$(php -r "\$c = include '$config'; echo \$c['database']['database'] ?? '';")
-    else
-        echo -e "${RED}不支援的站點類型：$type${RESET}"
-        return 1
-    fi
-
-    if [[ -z "$db_name" ]]; then
-        echo -e "${RED}無法從設定檔中讀取到資料庫名稱！${RESET}"
-        return 1
-    fi
-
-    echo "資料庫名稱為 '$db_name'。開始使用 'dba' 工具匯出..."
-
-    if ! command -v dba >/dev/null 2>&1; then
-      echo "沒有安裝dba 指令,正在嘗試安裝..."
-      bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
-    fi 
+  if [[ "$type" == "wp" ]]; then
+    local wp_config="$web_root/wp-config.php"
+    db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$wp_config")
+  elif [[ "$type" == "flarum" ]]; then
+    local config="$web_root/config.php"
+    db_name=$(php -r "\$c = include '$config'; echo \$c['database']['database'] ?? '';")
+  else
+    echo -e "${RED}不支援的站點類型：$type${RESET}"
+    sleep 1
+    return 1
+  fi
+  if [[ -z "$db_name" ]]; then
+    echo -e "${RED}無法從設定檔中讀取到資料庫名稱！${RESET}"
+    sleep 1
+    return 1
+  fi
+  if ! command -v dba >/dev/null 2>&1; then
+    bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
+  fi 
     
-    if ! dba mysql export "$db_name"; then
-      echo -e "${RED}使用 'dba' 工具備份資料庫失敗！${RESET}"
-      sleep 5
-      return 1
-    fi
+  if ! dba mysql export "$db_name"; then
+    echo -e "${RED}使用 'dba' 工具備份資料庫失敗！${RESET}"
+    sleep 5
+    return 1
+  fi
+  local latest_sql_export=$(ls -t "${dba_export_dir}/${db_name}"_*.sql 2>/dev/null | head -n1)
 
+  if [[ ! -f "$latest_sql_export" ]]; then
+    echo -e "${RED}資料庫備份指令執行成功，但在預期目錄中找不到 SQL 檔案！(${dba_export_dir})${RESET}"
+    sleep 1
+    return 1
+  fi
 
-    # 因為路徑是固定的，我們需要找到剛剛生成的檔案
-    # 'ls -t' 按修改時間排序，'head -n1' 取最新的那一個
-    local latest_sql_export=$(ls -t "${dba_export_dir}/${db_name}"_*.sql 2>/dev/null | head -n1)
+  echo -e "${GREEN}資料庫已成功匯出至：$latest_sql_export${RESET}"
+  if cp "$latest_sql_export" "$web_root/"; then
+    echo -e "${RED}無法複製 SQL 備份檔案，打包中止！${RESET}"
+    rm -f "$latest_sql_export" # 清理 dba 生成的原始 sql
+    sleep 1
+    return 1
+  fi
+  tar -czf "$backup_file" -C "$web_root" .
 
-    if [[ ! -f "$latest_sql_export" ]]; then
-        echo -e "${RED}資料庫備份指令執行成功，但在預期目錄中找不到 SQL 檔案！(${dba_export_dir})${RESET}"
-        return 1
-    fi
-
-    echo -e "${GREEN}資料庫已成功匯出至：$latest_sql_export${RESET}"
-
-
-    # --- 網站檔案打包 (File Archiving) ---
-    echo "正在打包網站檔案及資料庫備份..."
-
-    # ✅ 把最新的 SQL 備份從 dba 的預設路徑複製到 web_root 一起打包
-    cp "$latest_sql_export" "$web_root/"
-
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}無法複製 SQL 備份檔案，打包中止！${RESET}"
-        rm -f "$latest_sql_export" # 清理 dba 生成的原始 sql
-        return 1
-    fi
-
-    # 進行打包
-    tar -czf "$backup_file" -C "$web_root" .
-
-    # --- 清理工作 (Cleanup) ---
-    echo "清理臨時檔案..."
-    # 移除被複製到 web_root 的 SQL 檔案
-    rm -f "$web_root/$(basename "$latest_sql_export")"
-    # 移除 dba 在 /root/mysql_backups 生成的原始 SQL 檔案
-    rm -f "$latest_sql_export"
+  rm -f "$web_root/$(basename "$latest_sql_export")"
+  rm -f "$latest_sql_export"
     
-    echo -e "${GREEN}備份完成！檔案位置：$backup_file${RESET}"
+  echo -e "${GREEN}備份完成！檔案位置：$backup_file${RESET}"
 }
 
 # 主備份流程，支援多站型，清理多餘備份由自動備份排程一併處理
 backup_site() {
-    echo "============【 多站點備份精靈 】============"
-    read -p "請輸入站點 domain（例如 example.com）： " domain
-    [[ -z "$domain" ]] && echo "❌ 未輸入 domain，取消備份。" && return 1
+  echo "============【 多站點備份精靈 】============"
+  read -p "請輸入站點 domain（例如 example.com）： " domain
+  [[ -z "$domain" ]] && echo -e "${RED}未輸入 domain，取消備份。${RESET}" && sleep 1&& return 1
 
-    local web_root="/var/www/$domain"
-    local backup_dir="/opt/wp_backups/$domain"
-    mkdir -p "$backup_dir"
+  local web_root="/var/www/$domain"
+  local backup_dir="/opt/wp_backups/$domain"
+  mkdir -p "$backup_dir"
 
-    local type=$(detect_site_type "$web_root")
-    echo "偵測到站點類型：$type"
+  local type=$(detect_site_type "$web_root")
 
-    if [[ "$type" == "unknown" ]]; then
-        echo -e "${RED}不支援的站點類型，取消備份。${RESET}"
+  if [[ "$type" == "unknown" ]]; then
+    echo -e "${RED}不支援的站點類型，取消備份。${RESET}"
         return 1
     fi
 
@@ -244,8 +369,6 @@ backup_site() {
         read -p "保留最新幾份備份檔案？（輸入數字或留空跳過）： " keep_count
         if [[ "$keep_count" =~ ^[0-9]+$ ]]; then
             backup_site_type_clean "$type" "$domain" "$keep_count"
-        else
-            echo -e "${YELLOW}跳過自動清理。${RESET}"
         fi
     elif [[ "$mode_choice" == "2" ]]; then
         echo "請輸入自動備份的 crontab 時間格式 (如 '0 3 * * *'、'*/6 * * * *' 等)："
@@ -257,6 +380,7 @@ backup_site() {
         read -p "保留最新幾份備份檔案？（輸入數字，必填）： " keep_count
         if [[ ! "$keep_count" =~ ^[0-9]+$ ]]; then
             echo -e "${RED}請輸入有效數字。${RESET}"
+            sleep 1
             return 1
         fi
         cron_job="$cron_time bash -c '$(declare -f detect_site_type); $(declare -f backup_site_type); $(declare -f backup_site_type_clean); type=\"$(detect_site_type /var/www/$domain)\"; backup_site_type \"$type\" \"$domain\"; backup_site_type_clean \"$type\" \"$domain\" \"$keep_count\"'"
@@ -264,6 +388,7 @@ backup_site() {
         echo -e "${GREEN}已設定自動備份排程（$cron_time），並自動清理多餘備份（只保留最新 $keep_count 份）！${RESET}"
     else
         echo -e "${RED}無效選項，取消備份。${RESET}"
+        sleep 1
         return 1
     fi
     echo "============ 備份作業結束 ============"
@@ -304,6 +429,7 @@ backup_cron_remove() {
 
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#domains[@]} )); then
         echo -e "${RED}無效的序號。${RESET}"
+        sleep 1
         return 1
     fi
 
@@ -319,63 +445,8 @@ backup_cron_remove() {
     echo "============ 移除作業結束 ============"
 }
 
-#檢查系統版本
-check_system(){
-  if command -v apt >/dev/null 2>&1; then
-    system=1
-  elif command -v yum >/dev/null 2>&1; then
-    system=2
-    if grep -q -Ei "release 7|release 8" /etc/redhat-release; then
-      echo -e "${RED}不支援 CentOS 7 或 CentOS 8，請升級至 9 系列 (Rocky/Alma/CentOS Stream)${RESET}"
-      exit 1
-    fi
-  elif command -v apk >/dev/null 2>&1; then
-    system=3
-   else
-    echo -e "${RED}不支援的系統。${RESET}" >&2
-    exit 1
-  fi
-}
-
-check_and_start_service() {
-  if command -v openresty >/dev/null 2>&1; then
-    local service_name=openresty
-  elif command -v nginx >/dev/null 2>&1; then
-    local service_name=nginx
-  fi
-
-  # 用 service 查詢狀態，通常非 0 表示沒啟動或錯誤
-  service "$service_name" status >/dev/null 2>&1
-  if [ $? -ne 0 ]; then
-    service "$service_name" start
-  fi
-}
-
-check_web_environment() {
-  use_my_app=false
-  port_in_use=false
-
-  if [ "$system" = 3 ]; then
-    # Alpine: 使用 netstat 或 ss 檢查端口
-    if command -v netstat >/dev/null 2>&1; then
-      netstat -tln | grep -qE ':(80|443)\s' && port_in_use=true
-    elif command -v ss >/dev/null 2>&1; then
-      ss -tln | grep -qE ':(80|443)\s' && port_in_use=true
-    fi
-  else
-    # Debian/CentOS 使用 lsof 檢查端口
-    if command -v lsof >/dev/null 2>&1; then
-      lsof -iTCP:80 -sTCP:LISTEN >/dev/null 2>&1 && port_in_use=true
-      lsof -iTCP:443 -sTCP:LISTEN >/dev/null 2>&1 && port_in_use=true
-    fi
-  fi
-
-  # 有安裝 nginx 或 openresty 即可啟用
-  if command -v nginx >/dev/null 2>&1 || command -v openresty >/dev/null 2>&1; then
-    use_my_app=true
-  fi
-}
 clean_ssl_session_cache() {
+  [ $caddy -eq 1 ] && return 0
   local files
   local paths=(
     "/etc/nginx/nginx.conf"
@@ -397,100 +468,8 @@ clean_ssl_session_cache() {
   done
 }
 
-
-
-check_cert() {
-  local domain="$1"
-  local cert_dir="/etc/letsencrypt/live"
-
-  # 計算網域層級
-  IFS='.' read -ra domain_parts <<< "$domain"
-  local level=${#domain_parts[@]}
-
-  if [ "$level" -gt 6 ]; then
-    echo "網域層級過多（$level），請檢查輸入是否正確。" >&2
-    return 1
-  fi
-
-  # 掃描所有憑證資料夾，逐一分析 SAN
-  for dir in "$cert_dir"/*; do
-    [ -d "$dir" ] || continue
-    local cert_path="$dir/fullchain.pem"
-
-    if [ -f "$cert_path" ]; then
-      local san_list=$(openssl x509 -in "$cert_path" -noout -ext subjectAltName 2>/dev/null | \
-        grep -oE 'DNS:[^,]+' | sed 's/DNS://g')
-
-      for san in $san_list; do
-        if [[ "$san" == "$domain" ]] || [[ "$san" == "*.${domain#*.}" ]]; then
-          echo "$(basename "$dir")"
-          return 0
-        fi
-      done
-    fi
-  done
-
-  echo -e "${YELLOW}未找到包含 $domain 的有效憑證${RESET}" >&2
-  return 1
-}
-
-#檢查nginx
-check_nginx_start(){
-  if [[ $use_my_app = false && $port_in_use = false ]]; then
-    while true; do
-      clear
-      echo "=========站點管理器之安裝網站伺服器=========="
-      echo "1. 安裝nginx（支援HTTP3）"
-      echo "2. 安裝Openresy（支援LUA）"
-      read -p "請選擇安裝的伺服器[1-2，預設為2]" choice
-      choice=${choice:-2}
-      case $choice in
-      1)
-        install_web_server nginx 
-        break
-        ;;
-      2)
-        if [ $system == 1 ]; then
-          local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
-          if [[ $os == kali ]]; then
-            local codename=bookworm
-          else
-            local codename=$(grep -Po 'VERSION="[0-9]+ \(\K[^)]+' /etc/os-release)
-          fi
-          if ! curl -sf "https://openresty.org/package/debian/dists/${codename}/" >/dev/null; then
-            echo -e "${RED}官方倉庫尚未支援 ${codename}${RESET}"
-            sleep 2
-          else
-            install_web_server openresty
-            break
-          fi
-        elif [ $system == 3 ]; then
-          if curl -sf https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main >/dev/null; then
-            install_web_server openresty
-          else
-            install_web_server openresty compile
-            break
-          fi
-        fi
-        ;;
-      esac
-    done
-  fi
-}
-
-check_web_server(){
-  openresty=0
-  nginx=0
-  if command -v openresty >/dev/null 2>&1; then
-    openresty=1
-  elif command -v nginx >/dev/null 2>&1; then
-    nginx=1
-  fi
-}
-
 check_http3_support() {
   support_http3=false
-
   # 找出 nginx 或 openresty 的執行檔
   nginx_bin=""
   if command -v openresty >/dev/null 2>&1; then
@@ -522,161 +501,45 @@ check_nginx(){
     check_web_server
   else
     echo -e "${YELLOW}您已成功安裝，不用重複安裝${RESET}"
-    read -p "操作完成，請按任意鍵繼續..." -n1
+    sleep 1
   fi
 }
 
-#檢查需要安裝之軟體
-check_app(){
-  if ! command -v wget  >/dev/null 2>&1; then
-    case $system in
-      1)
-        apt update
-        apt install wget -y
-        ;;
-      2)
-        yum update
-        yum install -y wget
-        ;;
-      3)
-        apk update
-        apk add wget
-        ;;
-    esac
-  fi
-  if ! command -v curl  >/dev/null 2>&1; then
-    case $system in
-      1)
-        apt update
-        apt install curl -y
-        ;;
-      2)
-        yum update
-        yum install -y curl
-        ;;
-      3)
-        apk update
-        apk add curl
-        ;;
-    esac
-  fi
-  if ! command -v nano  >/dev/null 2>&1; then
-    case $system in
-      1)
-        apt update
-        apt install nano -y
-        ;;
-      2)
-        yum update
-        yum install -y nano
-        ;;
-      3)
-        apk update
-        apk add nano
-        ;;
-    esac
-  fi
-  if ! command -v ss &>/dev/null; then
-    case $system in
-      1)
-        apt update && apt install -y iproute2
-        ;;
-      2)
-        yum install -y iproute2
-        ;;
-      3)
-        apk update && apk add iproute2
-        ;;
-    esac
-  fi
-  if ! command -v lsof &>/dev/null; then
-    case $system in
-      1)
-        apt update && apt install -y lsof
-        ;;
-      2)
-        yum install -y lsof
-        ;;
-    esac
-  fi
-  if ! command -v jq &>/dev/null; then
-    case $system in
-      1)
-        apt update && apt install -y jq
-        ;;
-      2)
-        yum install -y jq
-        ;;
-      3)
-        apk add jq
-        ;;
-    esac
-  fi
-  if ! command -v lsb_release &>/dev/null; then
-    case $system in
-    1)
-      apt update && apt install -y lsb-release
-      ;;
-    2)
-      yum install -y redhat-lsb-core
-      ;;
-    esac
-  fi
-  if ! command -v dig &>/dev/null; then
-    case $system in
-    1)
-      apt update && apt install -y dnsutils
-      ;;
-    2)
-      yum install -y bind-utils
-      ;;
-    3)
-      apk add bind-tools
-      ;;
-    esac
-  fi
-}
 check_certbot(){
-  if ! command -v certbot >/dev/null 2>&1; then
-    echo "檢測certbot未安裝，正在安裝...."
-    case $system in 
-      1)
-        apt update
-        apt install -y snapd
-        snap install core && snap refresh core
-        snap install --classic certbot
-        ln -sf /snap/bin/certbot /usr/bin/certbot
-        snap set certbot trust-plugin-with-root=ok
-        snap install certbot-dns-cloudflare
-        ;;
-      2)
-        yum install -y epel-release
-        yum install -y python3-pip gcc libffi-devel python3-devel
-        python3 -m pip install --upgrade pip
-        python3 -m pip install --upgrade certbot certbot-nginx certbot-dns-cloudflare certbot-dns-gcore --root-user-action=ignore
-        ln -sf /usr/local/bin/certbot /usr/bin/certbot
-        ;;
-      3) 
-        apk update
-        apk add python3 py3-pip py3-virtualenv gcc musl-dev libffi-dev openssl-dev
-        python3 -m venv /opt/certbot-venv
-        (
-        source /opt/certbot-venv/bin/activate
-        python3 -m pip install --upgrade pip
-        python3 -m pip install certbot certbot-nginx certbot-dns-cloudflare certbot-dns-gcore
-        )
-        ln -s /opt/certbot-venv/bin/certbot /usr/local/bin/certbot
-        ;;
-    esac
-  else
-    echo -e "${GREEN}certbot 已安裝${RESET}"
+  [ $caddy -eq 1 ] && return 0
+  if command -v certbot >/dev/null 2>&1; then
+    return 0
   fi
+  case $system in 
+  1)
+    apt update
+    apt install -y snapd
+    snap install core && snap refresh core
+    snap install --classic certbot
+    ln -sf /snap/bin/certbot /usr/bin/certbot
+    snap set certbot trust-plugin-with-root=ok
+    snap install certbot-dns-cloudflare
+    ;;
+  2)
+    dnf install -y python3-pip gcc libffi-devel python3-devel
+    python3 -m pip install --upgrade pip
+    python3 -m pip install --upgrade certbot certbot-nginx certbot-dns-cloudflare certbot-dns-gcore --root-user-action=ignore
+    ln -sf /usr/local/bin/certbot /usr/bin/certbot
+    ;;
+  3) 
+    apk update
+    apk add python3 py3-pip py3-virtualenv gcc musl-dev libffi-dev openssl-dev
+    python3 -m pip install --upgrade pip
+    python3 -m pip install certbot certbot-nginx certbot-dns-cloudflare certbot-dns-gcore --break-system-packages
+    ln -sf /usr/local/bin/certbot /usr/bin/certbot
+    ;;
+  esac
 }
 
 check_php(){
   if ! command -v php >/dev/null 2>&1; then
-    echo -e "${GREEN}您好，您尚未安裝php，正在為您安裝...${RESET}"
     php_install
+    sleep 5
     php_fix
   fi
 }
@@ -715,6 +578,7 @@ check_flarum_supported_php() {
 
 
 create_directories() {
+  [ $caddy -eq 1 ] && return 0
   mkdir -p /home/web/
   mkdir -p /home/web/cert
   mkdir -p /etc/nginx/conf.d/
@@ -723,7 +587,7 @@ create_directories() {
   touch /etc/nginx/logs/access.log
 }
 chown_set(){
-  local ngx_user=$(get_nginx_run_user)
+  local ngx_user=$(get_web_run_user)
   case $system in
     1|2)
       mkdir -p /run/php
@@ -804,169 +668,154 @@ check_php_ext_available() {
   return 1
 }
 cf_cert_autogen() (
-    key_file="/ssl_ca/.cf_origin.key"
-    enc_file="/ssl_ca/.cf_origin.enc"
+  key_file="/ssl_ca/.cf_origin.key"
+  enc_file="/ssl_ca/.cf_origin.enc"
 
-    echo "===== Cloudflare Origin 憑證自動申請器 ====="
-    echo "感謝NS論壇之bananapork提供的cf文檔"
+  echo "===== Cloudflare Origin 憑證自動申請器 ====="
+  echo "感謝NS論壇之bananapork提供的cf文檔"
 
-    # 1. 檢查加密檔案
-    if [ ! -f "$key_file" ] || [ ! -f "$enc_file" ]; then
-        echo -e "${YELLOW}尚未設定帳號資訊，請輸入：${RESET}"
-        read -p "Cloudflare 登入信箱: " cf_email
-        read -p "Global API Key（將加密儲存）: " -s cf_key
-        echo
+  # 1. 檢查加密檔案
+  if [ ! -f "$key_file" ] || [ ! -f "$enc_file" ]; then
+    echo -e "${YELLOW}尚未設定帳號資訊，請輸入：${RESET}"
+    read -p "Cloudflare 登入信箱: " cf_email
+    read -p "Global API Key（將加密儲存）: " -s cf_key
+    echo
 
-        mkdir -p "$(dirname "$key_file")"
-        head -c 32 /dev/urandom > "$key_file"
-        chmod 600 "$key_file"
+    mkdir -p "$(dirname "$key_file")"
+    head -c 32 /dev/urandom > "$key_file"
+    chmod 600 "$key_file"
 
-        echo "$cf_email:$cf_key" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:"$key_file" -out "$enc_file"
-        chmod 600 "$enc_file"
-        echo -e "${GREEN}Cloudflare 認證資料已加密儲存${RESET}"
-    fi
+    echo "$cf_email:$cf_key" | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:"$key_file" -out "$enc_file"
+    chmod 600 "$enc_file"
+    echo -e "${GREEN}Cloudflare 認證資料已加密儲存${RESET}"
+  fi
 
-    # 2. 解密帳號資訊
-    cf_cred=$(openssl enc -d -aes-256-cbc -pbkdf2 -pass file:"$key_file" -in "$enc_file")
-    cf_email="$(echo "$cf_cred" | cut -d':' -f1)"
-    cf_api_key="$(echo "$cf_cred" | cut -d':' -f2)"
+  # 2. 解密帳號資訊
+  cf_cred=$(openssl enc -d -aes-256-cbc -pbkdf2 -pass file:"$key_file" -in "$enc_file")
+  cf_email="$(echo "$cf_cred" | cut -d':' -f1)"
+  cf_api_key="$(echo "$cf_cred" | cut -d':' -f2)"
 
-    # 3. 讀取用戶輸入的任何子域名
-    while true; do
-        read -p "請輸入你擁有的主域名（如 xxx.eu.org 或 xxx.com）: " input_domain
-        if [[ "$input_domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-            break
-        else
-            echo -e "${YELLOW}請輸入正確格式的域名（不可含 http/https/空格）${RESET}"
-        fi
-    done
-
-    # 4. 呼叫 Cloudflare API 抓 zone 列表，自動匹配 base domain
-    echo "正在查詢你帳號下的託管根域名..."
-    response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones" \
-        -H "X-Auth-Email: $cf_email" \
-        -H "X-Auth-Key: $cf_api_key" \
-        -H "Content-Type: application/json")
-
-    all_zones=$(echo "$response" | jq -r '.result[].name')
-    base_domain=""
-    for zone in $all_zones; do
-        if [[ "$input_domain" == *"$zone" ]]; then
-            base_domain="$zone"
-            break
-        fi
-    done
-
-    if [ -z "$base_domain" ]; then
-        echo -e "${RED}找不到與 $input_domain 對應的根域名，請確認該域名是否在你帳號內託管。${RESET}"
-        return 1
-    fi
-
-    echo -e "${GREEN}偵測成功：對應的根域名為 $base_domain${RESET}"
-
-    le_dir="/etc/letsencrypt/live/$base_domain"
-    mkdir -p "$le_dir"
-    cd "$le_dir" || return 1
-
-    openssl req -new -newkey rsa:2048 -nodes \
-        -keyout privkey.pem \
-        -out domain.csr \
-        -subj "/CN=$base_domain"
-
-    csr_content=$(awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' domain.csr)
-
-    echo -e "\n ${CYAN}發送憑證申請至 Cloudflare API...${RESET}"
-    response=$(curl -s -X POST https://api.cloudflare.com/client/v4/certificates \
-      -H "Content-Type: application/json" \
-      -H "X-Auth-Email: $cf_email" \
-      -H "X-Auth-Key: $cf_api_key" \
-      -d "{
-        \"hostnames\": [\"$base_domain\", \"*.$base_domain\"],
-        \"requested_validity\": 5475,
-        \"request_type\": \"origin-rsa\",
-        \"csr\": \"$csr_content\"
-      }")
-
-    if echo "$response" | grep -q '"success":true'; then
-        echo "$response" | jq -r '.result.certificate' > cert.pem
-        cat cert.pem > fullchain.pem
-        local cert_id=$(echo "$response" | jq -r '.result.id')
-        echo "$cert_id" > cf_cert_id.txt
-        echo -e "${GREEN}成功！憑證已儲存於：$le_dir${RESET}"
-        echo "- cert.pem"
-        echo "- fullchain.pem"
-        echo "- privkey.pem"
+  # 3. 讀取用戶輸入的任何子域名
+  while true; do
+    read -p "請輸入你擁有的主域名（如 xxx.eu.org 或 xxx.com）: " input_domain
+    if [[ "$input_domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+      break
     else
-        echo -e "${RED}憑證申請失敗，錯誤如下：${RESET}"
-        echo "$response" | jq
+      echo -e "${YELLOW}請輸入正確格式的域名（不可含 http/https/空格）${RESET}"
     fi
+  done
+  response=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones" \
+    -H "X-Auth-Email: $cf_email" \
+    -H "X-Auth-Key: $cf_api_key" \
+    -H "Content-Type: application/json")
+  all_zones=$(echo "$response" | jq -r '.result[].name')
+  base_domain=""
+  for zone in $all_zones; do
+    if [[ "$input_domain" == *"$zone" ]]; then
+      base_domain="$zone"
+      break
+    fi
+  done
+  if [ -z "$base_domain" ]; then
+    echo -e "${RED}找不到與 $input_domain 對應的根域名，請確認該域名是否在你帳號內託管。${RESET}"
+    sleep 1
+    return 1
+  fi
+  le_dir="/etc/letsencrypt/live/$base_domain"
+  mkdir -p "$le_dir"
+  cd "$le_dir"
+
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout privkey.pem \
+    -out domain.csr \
+    -subj "/CN=$base_domain"
+  csr_content=$(awk 'NF {sub(/\r/, ""); printf "%s\\n",$0;}' domain.csr)
+  response=$(curl -s -X POST https://api.cloudflare.com/client/v4/certificates \
+    -H "Content-Type: application/json" \
+    -H "X-Auth-Email: $cf_email" \
+    -H "X-Auth-Key: $cf_api_key" \
+    -d "{
+      \"hostnames\": [\"$base_domain\", \"*.$base_domain\"],
+      \"requested_validity\": 5475,
+      \"request_type\": \"origin-rsa\",
+      \"csr\": \"$csr_content\"
+    }")
+
+  if echo "$response" | grep -q '"success":true'; then
+    echo "$response" | jq -r '.result.certificate' > cert.pem
+    cat cert.pem > fullchain.pem
+    local cert_id=$(echo "$response" | jq -r '.result.id')
+    echo "$cert_id" > cf_cert_id.txt
+    echo -e "${GREEN}成功！憑證已儲存於：$le_dir${RESET}"
+    echo "- cert.pem"
+    echo "- fullchain.pem"
+    echo "- privkey.pem"
+  else
+    echo -e "${RED}憑證申請失敗，錯誤如下：${RESET}"
+    echo "$response" | jq
+    sleep 9
+  fi
 )
 
 cf_cert_revoke() (
-    input_domain="$1"
-    key_file="/ssl_ca/.cf_origin.key"
-    enc_file="/ssl_ca/.cf_origin.enc"
-    cf_cred=""
-    cf_api_key=""
-    cf_email=""
+  input_domain="$1"
+  key_file="/ssl_ca/.cf_origin.key"
+  enc_file="/ssl_ca/.cf_origin.enc"
+  cf_cred=""
+  cf_api_key=""
+  cf_email=""
     
 
-    echo "===== Cloudflare Origin 憑證吊銷器 ====="
+  echo "===== Cloudflare Origin 憑證吊銷器 ====="
 
-    if [ ! -f "$key_file" ] || [ ! -f "$enc_file" ]; then
-        echo -e "${RED}尚未設定 Cloudflare 認證資料，請先執行申請功能${RESET}"
-        return 1
-    fi
+  if [ ! -f "$key_file" ] || [ ! -f "$enc_file" ]; then
+    echo -e "${RED}尚未設定 Cloudflare 認證資料，請先執行申請功能${RESET}"
+    sleep 1
+    return 1
+  fi
 
-    # 解密認證資料
-    cf_cred=$(openssl enc -d -aes-256-cbc -pbkdf2 -pass file:"$key_file" -in "$enc_file")
-    cf_email="$(echo "$cf_cred" | cut -d':' -f1)"
-    cf_api_key="$(echo "$cf_cred" | cut -d':' -f2)"
+  # 解密認證資料
+  cf_cred=$(openssl enc -d -aes-256-cbc -pbkdf2 -pass file:"$key_file" -in "$enc_file")
+  cf_email="$(echo "$cf_cred" | cut -d':' -f1)"
+  cf_api_key="$(echo "$cf_cred" | cut -d':' -f2)"
 
-    # 輸入主域名
-    if [ -z "$input_domain" ]; then 
-      while true; do
-          read -p "請輸入你想吊銷憑證的主域名（如 example.com）: " input_domain
-          if [[ "$input_domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-              break
-          else
-              echo -e "${YELLOW} 請輸入正確格式的域名${RESET}"
-          fi
-      done
-    fi
+  # 輸入主域名
+  if [ -z "$input_domain" ]; then 
+    while true; do
+      read -p "請輸入你想吊銷憑證的主域名（如 example.com）: " input_domain
+      if [[ "$input_domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        break
+      else
+        echo -e "${YELLOW} 請輸入正確格式的域名${RESET}"
+      fi
+    done
+  fi
 
-    le_dir="/etc/letsencrypt/live/$input_domain"
-    cert_id_file="$le_dir/cf_cert_id.txt"
+  le_dir="/etc/letsencrypt/live/$input_domain"
+  cert_id_file="$le_dir/cf_cert_id.txt"
 
-    if [ ! -f "$cert_id_file" ]; then
-        echo -e "${RED} 找不到本地憑證 ID ($cert_id_file)，無法吊銷${RESET}"
-        return 1
-    fi
+  if [ ! -f "$cert_id_file" ]; then
+    echo -e "${RED} 找不到本地憑證 ID ($cert_id_file)，無法吊銷${RESET}"
+    sleep 1
+    return 1
+  fi
+  certificate_id=$(cat "$cert_id_file")
 
-    certificate_id=$(cat "$cert_id_file")
+  read -p "確定要吊銷 Cloudflare Origin 憑證 ID [$certificate_id] 嗎？(y/N): " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    revoke_response=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/certificates/$certificate_id" \
+      -H "X-Auth-Email: $cf_email" \
+      -H "X-Auth-Key: $cf_api_key" \
+      -H "Content-Type: application/json")
 
-    read -p "確定要吊銷 Cloudflare Origin 憑證 ID [$certificate_id] 嗎？(y/N): " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        revoke_response=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/certificates/$certificate_id" \
-          -H "X-Auth-Email: $cf_email" \
-          -H "X-Auth-Key: $cf_api_key" \
-          -H "Content-Type: application/json")
-
-        if echo "$revoke_response" | grep -q '"success":true'; then
-            echo -e "${GREEN}Cloudflare Origin 憑證已成功吊銷${RESET}"
-
-            read -p "是否一併刪除本地憑證檔案（cert.pem, fullchain.pem, privkey.pem）？(y/N): " del_local
-            if [[ "$del_local" =~ ^[Yy]$ ]]; then
-                rm -f "$le_dir/cert.pem" "$le_dir/fullchain.pem" "$le_dir/privkey.pem" "$cert_id_file"
-                echo -e "${GREEN}已刪除本地檔案${RESET}"
-            fi
-        else
-            echo -e "${RED}吊銷失敗，回傳如下：${RESET}"
-            echo "$revoke_response" | jq
-        fi
+    if echo "$revoke_response" | grep -q '"success":true'; then
+      echo -e "${GREEN}Cloudflare Origin 憑證已成功吊銷${RESET}"
+      rm -f "$le_dir/cert.pem" "$le_dir/fullchain.pem" "$le_dir/privkey.pem" "$cert_id_file"
     else
-        echo "取消吊銷"
+      echo -e "${RED}吊銷失敗，回傳如下：${RESET}"
+      echo "$revoke_response" | jq
     fi
+  fi
 )
 
 change_wp_admin_username() {
@@ -1084,25 +933,21 @@ change_wp_admin_password() {
 
 
 clean_nginx_ssl_config() {
-    conf_path=$(detect_conf_path)
+  conf_path=$(detect_conf_path)
 
-    echo "[INFO] Cleaning SSL configs in: $conf_path"
+  # 遍歷所有 conf 檔
+  find "$conf_path" -type f -name "*.conf" | while read -r file; do
 
-    # 遍歷所有 conf 檔
-    find "$conf_path" -type f -name "*.conf" | while read -r file; do
-
-        # 刪掉常見 SSL/TLS 設定行
-        sed -i \
-            -e '/^\s*ssl_protocols/d' \
-            -e '/^\s*ssl_ciphers/d' \
-            -e '/^\s*ssl_prefer_server_ciphers/d' \
-            -e '/^\s*ssl_session_cache/d' \
-            -e '/^\s*ssl_session_timeout/d' \
-            "$file"
-
-        echo "[OK] Cleaned $file"
-    done
-  restart_nginx_openresty
+    # 刪掉常見 SSL/TLS 設定行
+    sed -i \
+      -e '/^\s*ssl_protocols/d' \
+      -e '/^\s*ssl_ciphers/d' \
+      -e '/^\s*ssl_prefer_server_ciphers/d' \
+      -e '/^\s*ssl_session_cache/d' \
+      -e '/^\s*ssl_session_timeout/d' \
+    "$file"
+  done
+  restart_webserver
 }
 
 default(){
@@ -1117,9 +962,15 @@ default(){
       wget -O /etc/nginx/nginx.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
       id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
     fi
-    rm -f $detect_conf_path/default.conf $detect_conf_path/default
-    wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
-    restart_nginx_openresty
+    if [ $mode == caddy ]; then
+      rm -f /etc/caddy/Caddyfile
+      wget -O /etc/caddy/Caddyfile https://gitlab.com/gebu8f/sh/-/raw/main/nginx/caddy/Caddyfile
+      mkdir -p /etc/caddy/conf.d
+    else
+      rm -f $detect_conf_path/default.conf $detect_conf_path/default
+      wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+    fi
+    restart_webserver
     ;;
   3)
     if [ $mode == openresty ]; then
@@ -1130,83 +981,82 @@ default(){
     rm -f /etc/nginx/nginx.conf
     wget -O /etc/nginx/nginx.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
     wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
-    restart_nginx_openresty
+    restart_webserver
     ;;
   esac
 }
 
 detect_conf_path() {
-  local nginx_conf=""
+  local conf=""
+  local default_conf_dir=""
   if command -v openresty >/dev/null 2>&1 ; then
-    nginx_conf="/usr/local/openresty/nginx/conf/nginx.conf"
+    conf="/usr/local/openresty/nginx/conf/nginx.conf"
   elif command -v nginx >/dev/null 2>&1; then
-    nginx_conf="/etc/nginx/nginx.conf"
+    conf="/etc/nginx/nginx.conf"
+  elif command -v caddy >/dev/null 2>&1; then
+    conf="/etc/caddy/Caddyfile"
   fi
+  if command -v caddy >/dev/null 2>&1; then
+    # 找出有 import 且含 * 的行
+    local import_line
+    import_line=$(grep -E '^[[:space:]]*import[[:space:]]+/' "$conf" | grep '\*' | head -n 1)
 
-  if [ ! -f "$nginx_conf" ]; then
-    echo -e "${RED}錯誤：找不到 Nginx 設定檔 ${nginx_conf}${RESET}" >&2
-    return 1
+    if [[ -n "$import_line" ]]; then
+      local path
+      path=$(echo "$import_line" | sed -E 's/^[[:space:]]*import[[:space:]]+([^*]+)\*.*/\1/')
+      path="${path%/}"
+
+      echo "$path"
+      return 0
+    fi
+
+    default_conf_dir="/etc/caddy/conf.d"
+    mkdir -p "$default_conf_dir"
+
+    # 插入 import 行到 Caddyfile 最後一行
+    echo "" >> "$conf"
+    echo "import ${default_conf_dir}/*" >> "$conf"
+
+    # 重啟 Caddy
+    restart_webserver
+    echo "$default_conf_dir"
+    return 0
   fi
-
-  # 步驟 1: 尋找帶有萬用字元的 include 語句
-  # 使用 () 來捕獲我們真正需要的路徑部分
+  # 搜尋 include *.conf
   local search_regex='^[[:space:]]*include[[:space:]]+([^;]*\*[^;]*);'
-  
-  # 步驟 2: 使用 sed 的 -E 參數 (擴充型正則表達式) 來搜尋並擷取
-  local included_path=$(sed -E -n "s/${search_regex}/\1/p" "$nginx_conf" | head -n 1)
+  local included_path=$(sed -E -n "s/${search_regex}/\1/p" "$conf" | head -n 1)
 
-  # 步驟 3: 判斷是否找到了 include 路徑
   if [[ -n "$included_path" ]]; then
-
-    # 從路徑中提取目錄部分
     local target_dir
     target_dir=$(dirname "$included_path")
-
-    # 確保目錄存在
     mkdir -p "$target_dir"
-    
     echo "$target_dir"
     return 0
   fi
 
-  # --- 預設/備援邏輯 ---
-  # 如果前面的步驟沒有成功找到 include 規則，則執行這裡
-  local default_conf_dir=""
   if command -v openresty >/dev/null 2>&1; then
     default_conf_dir="/usr/local/openresty/nginx/conf/conf.d"
   else
     default_conf_dir="/etc/nginx/conf.d"
   fi
-  
+
   mkdir -p "$default_conf_dir"
-  
-  # 檢查 nginx.conf 的 http 區塊中是否已有此 include 語句
-  if ! grep -qE "include[[:space:]]+${default_conf_dir}/\*\.conf;" "$nginx_conf"; then
-    
-    # 在 http 區塊的結尾（最後一個 } 之前）插入 include 語句
+
+  # 若 nginx.conf 中沒有 include conf.d → 自動插入
+  if ! grep -qE "include[[:space:]]+${default_conf_dir}/\*\.conf;" "$conf"; then
     sed -i "/^http[[:space:]]*{/,/^}/ {
       /^}/i\\    include ${default_conf_dir}/*.conf;
-    }" "$nginx_conf" 2>/dev/null
+    }" "$conf" 2>/dev/null
     
-    # 測試配置並重啟
-    if command -v openresty >/dev/null 2>&1; then
-      openresty -t >/dev/null 2>&1 && service openresty restart >/dev/null 2>&1
-    elif command -v nginx >/dev/null 2>&1; then
-      nginx -t >/dev/null 2>&1 && service nginx restart >/dev/null 2>&1
-    fi
-
+    restart_webserver
   fi
-  
+
   echo "$default_conf_dir"
+  return 0
 }
 detect_sites() {
   local app_type="$1"
   local base_dir="/var/www"
-
-  [ -z "$app_type" ] && {
-    echo -e "${RED}請輸入要偵測的應用名稱，例如：WordPress 或 Flarum${RESET}"
-    return 1
-  }
 
   for dir in "$base_dir"/*; do
     [ ! -d "$dir" ] && continue
@@ -1230,12 +1080,6 @@ detect_sites_menu() {
   local app_type="$1"
   local base_dir="/var/www"
   local sites=()
-
-  [ -z "$app_type" ] && {
-    echo -e "${RED}請輸入要偵測的應用名稱，例如：WordPress 或 Flarum${RESET}" >&2
-    return 1
-  }
-
   for dir in "$base_dir"/*; do
     [ ! -d "$dir" ] && continue
 
@@ -1436,7 +1280,8 @@ flarum_setup() {
   local php_var=$(check_php_version)
   local supported_php_versions=$(check_flarum_supported_php)
   local max_supported_php=$(echo "$supported_php_versions" | tr ' ' '\n' | sort -V | tail -n1)
-  local ngx_user=$(get_nginx_run_user)
+  local ngx_user=$(get_web_run_user)
+  local php_ini=$(phpini_path)
 
   # 判斷 PHP 是否高於支援版本
   if [ "$(printf '%s\n' "$php_var" "$max_supported_php" | sort -V | tail -n1)" != "$php_var" ]; then
@@ -1448,8 +1293,9 @@ flarum_setup() {
   if echo "$supported_php_versions" | grep -qw "$php_var"; then
     local download_phpver="$php_var"
   else
-    echo -e "${YELLOW}您選擇的 PHP 版本不在 Flarum 支援列表，將改為使用 Flarum 支援的最高版本 $max_supported_php 的安裝包。${RESET}"
-    local download_phpver="$max_supported_php"
+    echo -e "${YELLOW}您選擇的 PHP 版本不在 Flarum 支援列表，因為實測發現很不穩定，故禁止安裝${RESET}"
+    sleep 3
+    return 1
   fi
 
   if ! command -v dba >/dev/null 2>&1; then
@@ -1505,7 +1351,26 @@ flarum_setup() {
   chown -R $ngx_user:$ngx_user "/var/www/$domain"
   setup_site "$domain" flarum
 
-  adjust_opcache_settings
+  if grep -qE '^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=' "$php_ini"; then
+    local current_revalidate_freq
+    current_revalidate_freq=$(grep -E '^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=' "$php_ini" | \
+      awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')
+
+    if [ "$current_revalidate_freq" = "0" ]; then
+      sed -i 's/^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=.*/opcache.revalidate_freq=1/' "$php_ini"
+    fi
+  fi
+
+  # 檢查並處理 opcache.validate_timestamps
+  if grep -qE '^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=' "$php_ini"; then
+    local current_validate_timestamps
+    current_validate_timestamps=$(grep -E '^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=' "$php_ini" | \
+      awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')
+
+    if [ "$current_validate_timestamps" = "0" ]; then
+      sed -i 's/^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=.*/opcache.validate_timestamps=2/' "$php_ini"
+    fi
+  fi
   
   case $system in
   1)
@@ -1565,6 +1430,7 @@ flarum_extensions() {
 
 
 generate_ssl_cert(){
+  [ $caddy -eq 1 ] && return 0
   openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /home/web/cert/default_server.key \
   -out /home/web/cert/default_server.crt \
@@ -1572,33 +1438,44 @@ generate_ssl_cert(){
   -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name"
 }
 
-get_nginx_run_user() {
+get_web_run_user() {
+  # --- 1. 偵測 Nginx ---
   local nginx_conf=""
-  
-  # 偵測 nginx.conf 路徑（簡化版）
   if [ -f /etc/nginx/nginx.conf ]; then
     nginx_conf="/etc/nginx/nginx.conf"
   elif [ -f /usr/local/openresty/nginx/conf/nginx.conf ]; then
     nginx_conf="/usr/local/openresty/nginx/conf/nginx.conf"
-  else
-    echo "nobody"
-    return 1
   fi
 
-  # 讀取 user 行，抓第一個 user 名稱，去掉分號
-  local user
-  user=$(grep -E '^\s*user\s+' "$nginx_conf" | head -1 | awk '{print $2}' | sed 's/;//')
-
-  # 如果沒找到 user，預設 nobody
-  if [ -z "$user" ]; then
-    echo "nobody"
-  else
+  if [ -n "$nginx_conf" ]; then
+    # 讀取 user 行，抓第一個 user 名稱，去掉分號
+    local user
+    user=$(grep -E '^\s*user\s+' "$nginx_conf" | head -1 | awk '{print $2}' | sed 's/;//')
+    if [ -z "$user" ]; then
+      user="nobody"
+    fi
     echo "$user"
+    return 0
+  fi
+
+  # --- 2. 偵測 Caddy ---
+  local pid=$(ss -ltnp 2>/dev/null | awk '/:(80|443)/ && /users:/{gsub(/.*pid=/,""); gsub(/,.*$/,""); print $NF; exit}')
+    
+  if [ -n "$pid" ]; then
+    local user
+    user=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status")
+    if [ -n "$user" ]; then
+      user=$(getent passwd "$user" | cut -d: -f1)
+      echo "$user"
+    else
+      return 1
+    fi
+    return 0
   fi
 }
 
 html_sites(){
-  local ngx_user=$(get_nginx_run_user)
+  local ngx_user=$(get_web_run_user)
   read -p "請輸入網址:" domain
   check_cert "$domain" || {
     echo "未偵測到 Let's Encrypt 憑證，嘗試自動申請..."
@@ -1719,7 +1596,7 @@ httpguard_setup()(
     fi
       
   if nginx -t; then
-    restart_nginx_openresty
+    restart_webserver
     echo "HttpGuard 安裝完成"
     menu_httpguard
   else
@@ -1940,6 +1817,8 @@ EOF
       fi
       ;;
     esac
+    check_web_server
+    default $mode
   elif [ $mode == nginx ]; then
     case $system in
     1)
@@ -1981,6 +1860,32 @@ EOF
     esac
     check_web_server
     default $mode
+  elif [ $mode == caddy ]; then 
+    case $system in
+    1)
+      apt install -y debian-keyring debian-archive-keyring apt-transport-https
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+      chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+      chmod o+r /etc/apt/sources.list.d/caddy-stable.list
+      apt update
+      apt install caddy
+      systemctl enable caddy
+      ;;
+    2)
+      if [ -f /etc/fedora-release ]; then
+        dnf install -y dnf5-plugins
+        dnf copr enable @caddy/caddy
+        dnf install -y caddy
+      else
+        dnf install -y dnf-plugins-core
+        dnf copr enable @caddy/caddy
+        dnf install -y caddy
+      fi
+      systemctl enable caddy
+    esac
+    check_web_server
+    default $mode
   fi
 }
 
@@ -1998,7 +1903,6 @@ install_wpcli_if_needed() {
 }
 
 php_install() {
-  echo -e "${CYAN}開始安裝 PHP 環境...${RESET}"
   case $system in
     1)
       local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
@@ -2139,7 +2043,7 @@ php_install() {
 
 php_fix(){
   local php_var=$(check_php_version)
-  local ngx_user=$(get_nginx_run_user)
+  local ngx_user=$(get_web_run_user)
 
   if [ $system -eq 1 ]; then  # Debian/Ubuntu
     sed -i -r "s|^;?(user\s*=\s*).*|\1$ngx_user|" /etc/php/$php_var/fpm/pool.d/www.conf
@@ -2175,7 +2079,6 @@ php_fix(){
 
 
 php_switch_version() {
-  echo -e "${CYAN}開始 PHP 升級/降級程序...${RESET}"
   case $system in
   1)
     oldver=$(check_php_version)
@@ -2307,7 +2210,6 @@ php_switch_version() {
     esac
   done
 
-  echo -e "${CYAN}重新啟動服務...${RESET}"
   case $system in
     1)
       systemctl enable php$newver-fpm
@@ -2325,6 +2227,7 @@ php_switch_version() {
       rc-service nginx start
       ;;
   esac
+  sleep 5
   php_fix
 
   echo -e "${GREEN}PHP 升級/降級完成（從 $oldver → $newver）${RESET}"
@@ -2338,15 +2241,7 @@ php_tune_upload_limit() {
     return 1
   fi
 
-  if [ $system -eq 1 ]; then
-    php_ini=/etc/php/$php_var/fpm/php.ini
-  else
-    php_ini=$(php -i | grep "Loaded Configuration File" | awk '{print $5}')
-  fi
-  if [ ! -f "$php_ini" ]; then
-    echo "無法找到 php.ini，無法調整上傳限制。"
-    return 1
-  fi
+  php_ini=$(phpini_path)
 
   echo "目前使用的 php.ini：$php_ini"
   read -p "請輸入最大上傳大小（例如 64M、100M、1G，預設 64M）：" max_upload
@@ -2472,11 +2367,13 @@ reverse_proxy(){
   echo "已建立 $domain 反向代理站點。"
 }
 
-restart_nginx_openresty() {
+restart_webserver() {
   if [ "$openresty" -eq "1" ]; then
     service openresty restart
   elif [ "$nginx" -eq "1" ]; then
     service nginx restart
+  elif [ "$caddy" -eq "1" ]; then 
+    service caddy restart
   fi
 }
 
@@ -2745,7 +2642,7 @@ set_site_permissions() {
   local mode="$1"
   local dest_dir="$2"
 
-  local ngx_user=$(get_nginx_run_user)
+  local ngx_user=$(get_web_run_user)
 
   echo -e "${CYAN}設定檔案擁有者為：$owner${RESET}"
   chown -R $ngx_user:$ngx_user "$dest_dir"
@@ -2813,7 +2710,33 @@ setup_site() {
   local escaped_cert=$(printf '%s' "$domain_cert" | sed 's/[&/\]/\\&/g') # 取得主域名或泛域名作為憑證目錄
   local conf_file=$(detect_conf_path)/$domain.conf
   clean_ssl_session_cache
-
+  
+  if [ $caddy -eq 1 ]; then
+    case $system in
+    1|2)
+      case $type in
+      html|php|flarum)
+        local conf_url="https://gitlab.com/gebu8f/sh/-/raw/main/nginx/caddy/domain_${type}.conf"
+        wget -qO "$conf_file" "$conf_url"
+        sed -i -e "s|domain|$domain|g" "$conf_file"
+        restart_webserver
+        ;;
+      proxy)
+        local target_url=$3
+        local target_protocol=$4
+        local target_port=$5
+        wget -O "$conf_file" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/caddy/domain_proxy.conf
+        sed -i "s|reverse_proxy host:port|reverse_proxy $target_protocol://$target_url:$target_port|g" "$conf_file"
+        sed -i -e "s|domain|$domain|g" "$conf_file"
+        restart_webserver
+        ;;
+      *)
+        echo "不支援的類型: $type"; return 1;;
+      esac
+      ;;
+    esac
+    return $?
+  fi
   case $system in
     1|2|3)
       case $type in
@@ -2835,7 +2758,7 @@ setup_site() {
               return 1
             }
           fi
-          restart_nginx_openresty
+          restart_webserver
           ;;
         proxy)
           local target_url=$3
@@ -2858,7 +2781,7 @@ setup_site() {
               return 1
             }
           fi
-          restart_nginx_openresty
+          restart_webserver
           ;;
         *)
           echo "不支援的類型: $type"; return 1;;
@@ -2992,12 +2915,12 @@ show_cert_status() (
   # 在子 Shell 中執行
   check_web_environment
   if [[ $use_my_app != true ]]; then
-    echo -e "===== Nginx 站點憑證狀態 ====="
+    echo -e "===== 站點憑證狀態 ====="
     echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
     return 0
   fi
 
-  echo -e "===== Nginx 站點憑證狀態 ====="
+  echo -e "===== 站點憑證狀態 ====="
 
   if (( BASH_VERSINFO[0] < 4 )); then
       echo "錯誤：此腳本需要 Bash 4.0 或更高版本才能使用關聯陣列。" >&2
@@ -3156,6 +3079,57 @@ show_cert_status() (
       if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " | "; fi;
     done; printf "\n"
   done
+)
+
+show_domain_status_caddy() (
+  echo "===== Caddy 站點域名列表 ====="
+
+  local CADDY_CONF_MAIN="/etc/caddy/Caddyfile"
+  local CADDY_CONF_DIR=$(detect_conf_path)
+
+  if [[ ! -f "$CADDY_CONF_MAIN" ]]; then
+      echo "未找到 Caddy 主配置：$CADDY_CONF_MAIN"
+      return 1
+  fi
+
+  declare -A domain_set
+
+  # --- 解析 domain {...} 格式 ---
+  parse_domains() {
+    local file="$1"
+    while IFS= read -r line; do
+      # 僅匹配：
+      #   example.com {
+      #   sub.domain.net {
+      if [[ "$line" =~ ^([A-Za-z0-9._-]+)\ \{$ ]]; then
+        domain_set["${BASH_REMATCH[1]}"]=1
+      fi
+    done < "$file"
+  }
+
+  # 主 Caddyfile
+  parse_domains "$CADDY_CONF_MAIN"
+
+  # import conf.d/*.caddy
+  if [[ -d "$CADDY_CONF_DIR" ]]; then
+    while IFS= read -r f; do
+      parse_domains "$f"
+    done < <(find "$CADDY_CONF_DIR" -maxdepth 1 -type f -name "*.conf")
+  fi
+
+  # --- 輸出 ---
+  
+  if [[ ${#domain_set[@]} -eq 0 ]]; then
+    echo "找不到任何域名。"
+    return 0
+  fi
+
+  echo "域名"
+  echo "----"
+
+  for domain in "${!domain_set[@]}"; do
+    echo "$domain"
+  done | sort
 )
 
 
@@ -3400,10 +3374,10 @@ ssl_apply() (
     mkdir -p /var/www/acme
     wget -O "$detect_conf_path/acme.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_http.conf
     sed -i "s|domain|$domains|g" "$detect_conf_path/acme.conf"
-    restart_nginx_openresty
+    restart_webserver
     certbot_args+=(--webroot --webroot-path /var/www/acme)
     # 執行後的清理工作
-    trap 'rm -f "$detect_conf_path/acme.conf"; /opt/certbot-hook/open_port.sh del 80; restart_nginx_openresty' RETURN
+    trap 'rm -f "$detect_conf_path/acme.conf"; /opt/certbot-hook/open_port.sh del 80; restart_webserver' RETURN
     needs_auto_renew=2
     ;;
   *)
@@ -3474,7 +3448,7 @@ toggle_httpguard_module() {
   if [ $? -eq 0 ]; then
     echo -e "${GREEN}模組 [$module_name] 狀態已更新為 [$new_state]。${RESET}"
     echo "正在重啟 Nginx/OpenResty 以應用變更..."
-    restart_nginx_openresty
+    restart_webserver
     if [ $? -eq 0 ]; then
       echo -e "${GREEN}Nginx/OpenResty 已重啟成功。${RESET}"
     else
@@ -3548,7 +3522,7 @@ update_script() {
   rm -f "$temp_path"
 }
 
-uninstall_nginx(){
+uninstall_webserver(){
   check_web_server
   if [ $openresty -eq 1 ]; then
     case $system in
@@ -3594,6 +3568,12 @@ uninstall_nginx(){
       rm -rf $nginx_path
     fi
     pkill -f nginx
+  elif [ $caddy -eq 1 ]; then
+    case $system in
+    1)  apt purge -y caddy ;;
+    2)  yum remove -y caddy ;;
+    esac
+    rm -rf /etc/caddy
   fi
   exit 0
 }
@@ -3603,7 +3583,7 @@ uninstall_nginx(){
 wordpress_site() {
   local MY_IP=$(curl -s https://api64.ipify.org)
   local HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" --max-time 3 https://wordpress.org)
-  local ngx_user=$(get_nginx_run_user)
+  local ngx_user=$(get_web_run_user)
 
   if [[ "$HTTP_CODE" == "200" ]]; then
     echo "您的IP地址支持訪問 WordPress。"
@@ -3673,6 +3653,47 @@ wordpress_site() {
   echo "WordPress 網站 $domain 建立完成！請瀏覽 https://$domain 開始安裝流程。"
 }
 
+
+self_signed_certificate()(
+  read -p "請輸入您的域名或 IP 地址 (Common Name)：" domain
+  
+
+  mkdir -p /etc/letsencrypt/live/$domain
+  
+  # 設置憑證和金鑰的完整路徑
+  CERT_DIR="/etc/letsencrypt/live/$domain"
+  KEY_FILE="$CERT_DIR/privkey.pem"
+  CERT_FILE="$CERT_DIR/fullchain.pem"
+  
+  # 3. 檢查目錄是否已存在憑證，避免覆蓋
+  if [ -f "$KEY_FILE" ] && [ -f "$CERT_FILE" ]; then
+    read -p "警告：憑證已存在於 $domain，是否要覆蓋？(y/N)[預設:n] " response
+    response=${response,,}
+    if ! [[ "$response" =~ ^(y|yes)$ ]]; then
+      echo "操作已取消。"
+      return 0
+    fi
+  fi
+  
+  
+  openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    -keyout "$KEY_FILE" \
+    -out "$CERT_FILE" \
+    -subj "/C=GB/ST=Globe/L=Globe/O=gebu8f7/OU=IT/CN=$domain" 
+    
+  # --- 5. 完成與提示 ---
+  
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}自簽名憑證生成成功！${RESET}"
+    echo "   域名/IP (CN): $domain"
+    echo "   私鑰路徑: $KEY_FILE"
+    echo "   憑證路徑: $CERT_FILE"
+    
+    chmod 700 "$KEY_FILE"
+  fi
+)
+
+
 # 菜單
 
 menu_httpguard(){
@@ -3713,7 +3734,7 @@ menu_httpguard(){
     5)
     sed -i '/HttpGuard\/init.lua\|HttpGuard\/runtime.lua\|lua_package_path\|lua_package_cpath\|lua_shared_dict guard_dict\|lua_shared_dict dict_captcha\|lua_max_running_timers/d' /etc/nginx/nginx.conf
     rm -rf "/etc/nginx/HttpGuard"
-    restart_nginx_openresty
+    restart_webserver
     echo "HttpGuard 卸載完成。"
     read -p "操作完成，請按任意鍵繼續..." -n1
     ;;
@@ -3753,61 +3774,100 @@ menu_add_sites(){
   esac
 }
 
-menu_del_sites(){
-  local domain=$1
-  if [ -z "$domain" ]; then
-    read -p "請輸入要刪除的網址：" domain
+menu_del_sites() {
+  local conf_dir=$(detect_conf_path)
+
+  # 取得所有 .conf
+  local raw_files=("$conf_dir"/*.conf)
+  local site_files=()
+
+  # 過濾掉 basename 不含 "." 的
+  for f in "${raw_files[@]}"; do
+    local name=$(basename "$f" .conf)
+    if [[ "$name" == *.* ]]; then
+      site_files+=("$f")
+    fi
+  done
+
+  if [ ${#site_files[@]} -eq 0 ]; then
+    echo "目前沒有任何可刪除的站點。"
+    return 1
   fi
-  domain="$(echo $domain | xargs)"  # 去除多餘空白
-  local conf_file=$(detect_conf_path)/$domain.conf
 
-  local is_wp_site=false
-  local is_flarum_site=false
+  echo "請選擇要刪除的站點："
+  local idx=1
+  for f in "${site_files[@]}"; do
+    local name=$(basename "$f" .conf)
+    echo "  $idx) $name"
+    idx=$((idx + 1))
+  done
 
-  if [ -f "/var/www/$domain/wp-config.php" ]; then
-    is_wp_site=true
-  elif [ -f "/var/www/$domain/config.php" ]; then
-    is_flarum_site=true
+  echo
+  read -p "請輸入數字：" choice
+
+  # 非數字
+  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+    echo "無效的選擇。"
+    return 1
   fi
 
-  # 吊銷 SSL
+  local max=${#site_files[@]}
+  if (( choice < 1 || choice > max )); then
+    echo "選擇超出範圍。"
+    return 1
+  fi
+
+  local conf_file="${site_files[$((choice - 1))]}"
+  local domain=$(basename "$conf_file" .conf)
+
+  read -p "確定要刪除站點 [$domain] 嗎？(Y/n) " confirm
+  confirm=${confirm,,}
+
+  if [[ "$confirm" != "y" && "$confirm" != "" ]]; then
+    return 0
+  fi
+  
+  local site_type=$(detect_site_type "/var/wwe/$domain")
+  
+  # SSL 吊銷
   menu_ssl_revoke "$domain" || {
-    echo "吊銷 SSL 證書失敗，停止後續操作。"
+    echo "吊銷 SSL 失敗，停止操作。"
     return 1
   }
 
-  # 刪除 Nginx 配置與網站資料夾
+  # 刪除配置與網站資料夾
   rm -rf "$conf_file"
   rm -rf "/var/www/$domain"
 
-  # 刪除資料庫（依網站類型判斷）
-  if [ "$is_wp_site" = true ]; then
+  # 刪除資料庫
+  if [ $site_type = wp ]; then
     db_name="wp_${domain//./_}"
-    echo "正在刪除 WordPress 資料庫與使用者..."
-  elif [ "$is_flarum_site" = true ]; then
+  elif [ $site_type = flarum ]; then
     db_name="flarum_${domain//./_}"
-    echo "正在刪除 Flarum 資料庫與使用者..."
   fi
+  
+  echo $detect_site_type
 
-  if [ "$is_wp_site" = true ] || [ "$is_flarum_site" = true ]; then
+  if [ $site_type != "unknown" ]; then
     if ! command -v dba >/dev/null 2>&1; then
       bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
     fi
-    dba mysql del $db_name --force
+    dba mysql del "$db_name" --force
   fi
 
-  # 重啟 nginx
-  restart_nginx_openresty
-
-  echo "已刪除 $domain 站點。"
+  restart_webserver
+  echo -e "${GREEN}已刪除站點：$domain${RESET}"
 }
 
 menu_ssl_apply() {
+  [ $caddy -eq 1 ] && return 0
   echo "SSL 申請"
   echo "-------------------"
-  echo "1. 申請 Certbot(Let's Encrypt、ZeroSSL、Google) 憑證"
+  echo "1. Certbot(Let's Encrypt、ZeroSSL、Google) 憑證"
   echo ""
-  echo "2. 申請 Cloudflare 原始憑證"
+  echo "2. Cloudflare 原始憑證"
+  echo ""
+  echo "3. 自簽名"
   echo "-------------------"
   echo "0. 返回"
   read -p "請選擇: " ssl_choice
@@ -3818,66 +3878,96 @@ menu_ssl_apply() {
     2) 
       cf_cert_autogen
       ;;
+    3)
+      self_signed_certificate
+      ;;
     0) return ;;
   esac
 }
 
-
-
 menu_ssl_revoke() {
+  [ $caddy -eq 1 ] && return 0
   local cert_dir="/etc/letsencrypt/live"
-  local domain="$1"
-  if [ -z "$domain" ]; then
-    read -p "請輸入要吊銷憑證的域名: " domain
-  fi
 
-  # 先取得 cert_info 與 cert_path
-  local cert_info
-  if ! cert_info=$(check_cert "$domain"); then
-    echo "憑證檢查失敗: $cert_info"
+  # 找所有憑證資料夾
+  local dirs=("$cert_dir"/*)
+  local domain_list=()
+
+  # 過濾有效的 live domain
+  for d in "${dirs[@]}"; do
+    if [[ -d "$d" ]] && [[ -f "$d/cert.pem" ]]; then
+      domain_list+=("$(basename "$d")")
+    fi
+  done
+
+  if [ ${#domain_list[@]} -eq 0 ]; then
+    echo "沒有可吊銷的憑證。"
     return 1
   fi
 
-  local cert_path="/etc/letsencrypt/live/$cert_info/cert.pem"
-  if [ ! -f "$cert_path" ]; then
-    echo "找不到憑證檔案: $cert_path"
+  echo "請選擇要吊銷的憑證："
+  local idx=1
+  for name in "${domain_list[@]}"; do
+    echo "  $idx) $name"
+    idx=$((idx + 1))
+  done
+
+  echo
+  read -p "請輸入數字：" choice
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+    echo "無效選擇。"
     return 1
   fi
 
-  echo "正在解析憑證 [$cert_info] 中的 SAN 項目："
+  if (( choice < 1 || choice > ${#domain_list[@]} )); then
+    echo "超出範圍。"
+    return 1
+  fi
+
+  local cert_info="${domain_list[$((choice - 1))]}"
+  local cert_path="$cert_dir/$cert_info/cert.pem"
+
   openssl x509 -in "$cert_path" -noout -text | grep -A1 "Subject Alternative Name"
   echo
-  echo "確定要吊銷憑證 [$domain] 嗎？（y/n）"
+
+  echo -e "${YELLOW}確定要吊銷 [$cert_info] 嗎？${RESET}(Y/n)"
   read -p "選擇：" confirm
-  [[ "$confirm" != "y" ]] && echo "已取消。" && return 0
+  confirm=${confirm,,}
+  [[ "$confirm" != "y" && "$confirm" != "" ]] && echo "已取消。" && return 0
 
+  # ======= 憑證類型判斷 =======
 
-  # 檢查憑證內容是否包含 Cloudflare 字樣
-  if openssl x509 -in "$cert_path" -noout -subject | grep -i -q "CloudFlare Origin Certificate"; then
-    cf_cert_revoke "$cert_info" || return 1
-    return 0
+  # Cloudflare Origin
+  if openssl x509 -in "$cert_path" -noout -subject | grep -qi "CloudFlare Origin Certificate"; then
+    cf_cert_revoke "$cert_info"
+    return $?
   fi
 
-  echo "檢查和更新cerbot"
-  check_certbot
-  update_certbot
-  
-  echo "正在吊銷憑證 $cert_info..."
-  certbot revoke --cert-path "$cert_path" --non-interactive --quiet && echo "已吊銷憑證"
+  local issuer=$(openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null)
+  local subject=$(openssl x509 -in "$cert_path" -noout -subject)
 
-  echo
-  echo "是否刪除憑證檔案 [$cert_info]？（y/n）"
-  read -p "選擇：" delete_choice
-  if [[ "$delete_choice" == "y" ]]; then
+  if ! [ "$issuer" = "$subject" ]; then
+    check_certbot
+    update_certbot
+
+    certbot revoke --cert-path "$cert_path" --non-interactive --quiet \
+    && echo -e "${GREEN}吊銷成功。${RESET}"
+  fi
+  read -p "是否刪除憑證檔案 [$cert_info]？(Y/n) " delete_choice
+  delete_choice=${delete_choice,,}
+
+  if [[ "$delete_choice" == "y" || "$delete_choice" == "" ]]; then
     rm -rf "$cert_dir/$cert_info"
     rm -rf "/etc/letsencrypt/archive/$cert_info"
-    rm -f "/etc/letsencrypt/renewal/$cert_info.conf"
-    echo "已刪除憑證資料夾"
+    rm -rf "/etc/letsencrypt/renewal/$cert_info.conf"
+    echo -e "${GREEN}已刪除憑證資料${RESET}。"
 
-    if [ -z "$(find "$cert_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
+    # 若所有憑證刪光了，移除 cron
+    if [ -z "$(find "$cert_dir" -mindepth 1 -maxdepth 1 -type d)" ]; then
       if crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        crontab -l 2>/dev/null | grep -v "certbot renew" | crontab -
-        echo "已移除自動續訂任務"
+        crontab -l | grep -v "certbot renew" | crontab -
+        echo -e "${GREEN}已移除 certbot 自動續訂。${RESET}"
       fi
     fi
   fi
@@ -4030,9 +4120,9 @@ menu_php() {
     case $choice in
       1)
         clear
-        php_install || read -p "操作完成，請按任意鍵繼續..." -n1 && return
+        php_install
+        sleep 5
         php_fix
-        
         read -p "操作完成，請按任意鍵繼續..." -n1
         ;;
       2) 
@@ -4044,7 +4134,7 @@ menu_php() {
       3)
         clear
         check_php
-        local ngx_user=$(get_nginx_run_user)
+        local ngx_user=$(get_web_run_user)
         read -p "請輸入您的域名：" domain
         check_cert "$domain" || {
           echo "未偵測到 Let's Encrypt 憑證，嘗試自動申請..."
@@ -4135,119 +4225,103 @@ menu_php() {
 }
 
 #主菜單
-show_menu(){
-  show_cert_status
-  echo "-------------------"
-  echo "站點管理器"
-  echo ""
-  echo -e "${YELLOW}i. 安裝 Nginx / OpenResty          r. 解除安裝 Nginx / OpenResty${RESET}"
-  echo ""
-  echo "1. 新增站點           2. 刪除站點"
-  echo ""
-  echo "3. 申請 SSL 證書      4. 刪除 SSL 證書"
-  echo ""
-  echo "5. 切換 Certbot 廠商  6. PHP 管理"
-  echo ""
-  echo "7. 修復Cloudflare 525錯誤    8. MYSQL安裝及管理"
-  echo ""
-  echo "9. Docker安裝及管理"
-  echo ""
-  echo "u. 更新腳本           0. 離開"
-  echo "-------------------"
-  echo -n -e "\033[1;33m請選擇操作 [1-9 / i u 0]: \033[0m"
+show_menu_caddy(){
+  while true; do
+    conf_file=""
+    domain=""
+    clear
+    show_domain_status_caddy
+    echo "-------------------"
+    echo "站點管理器"
+    echo ""
+    echo -e "${YELLOW}r. 解除安裝 Caddy${RESET}"
+    echo ""
+    echo "1. 新增站點           2. 刪除站點"
+    echo ""
+    echo "3. PHP 管理           4. MYSQL安裝及管理"
+    echo ""
+    echo "5. Docker安裝及管理"
+    echo ""
+    echo "u. 更新腳本           0. 離開"
+    echo "-------------------"
+    echo -n -e "\033[1;33m請選擇操作 [1-5 / i u 0]: \033[0m"
+    read -r choice
+    case $choice in
+    1)
+      check_no_ngx || continue
+      menu_add_sites
+      read -p "操作完成，請按任意鍵繼續..." -n1
+      ;;
+    2)
+      check_no_ngx || continue
+      menu_del_sites 
+      read -p "操作完成，請按任意鍵繼續..." -n1
+      ;;
+    3)
+      check_no_ngx || continue
+      menu_php
+      ;;
+    4)
+      if ! command -v dba >/dev/null 2>&1; then
+        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
+      fi
+      if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then
+        dba mysql install
+      else
+        dba mysql
+      fi
+      ;;
+    5)
+      if ! command -v d >/dev/null 2>&1; then
+        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/docker/install.sh)
+      else
+        d
+      fi
+      ;;
+    0)
+      exit 0
+      ;;
+    u)
+      clear
+      echo "更新腳本"
+      echo "------------------------"
+      update_script
+      ;;
+    r)
+      uninstall_webserver
+      ;;
+    *)
+      echo "無效選擇。"
+    esac
+  done
 }
 
-case "$1" in
-  --version|-V)
-    echo "站點管理器版本 $version"
-    exit 0
-    ;;
-esac
-
-# 只有不是 --version 或 -V 才會執行以下初始化
-check_system
-check_app
-check_web_environment
-check_nginx_start
-check_and_start_service
-check_web_server
-
-case "$1" in
-  setup)
-    domain="$2"
-    site_type="$3"
-
-    if [[ -z "$domain" || -z "$site_type" ]]; then
-      echo "用法錯誤: bash ng.sh setup_site <domain> <type>"
-      echo "或 proxy 類型: bash ng.sh setup_site <domain> proxy <url> <protocol> <port>"
-      exit 1
-    fi
-
-    echo "正在處理站點: $domain (類型: $site_type)"
-
-    
-
-    case "$site_type" in
-      html|flarum|php)
-        setup_site "$domain" $site_type
-        ;;
-      proxy)
-        target_url="$4"
-        target_proto="$5"
-        target_port="$6"
-
-        if [[ -z "$target_url" || -z "$target_proto" || -z "$target_port" ]]; then
-          echo "proxy 類型需要提供 target_url protocol port"
-          exit 1
-        fi
-        
-        # 自動申請 SSL（若不存在）
-        check_cert "$domain" || {
-          echo "未偵測到 Let Encrypt 憑證，嘗試自動申請..."
-          if ssl_apply "$domain"; then
-            echo "申請成功，重新驗證憑證..."
-            check_cert "$domain" || {
-              echo "申請成功但仍無法驗證憑證，中止建立站點"
-              return 1
-            }
-          else
-              echo "SSL 申請失敗，中止建立站點"
-              return 1
-          fi
-        }
-
-        setup_site "$domain" proxy "$target_url" "$target_proto" "$target_port"
-        exit 0
-        ;;
-    esac
-    ;;
-  del)
-    domain="$2"
-    menu_del_sites "$domain"
-    exit 0
-    ;;
-  api)
-    if [[ "$2" == "search" && "$3" == "proxy_domain" ]]; then
-      target="$4"
-      conf_file=$(detect_conf_path)/
-      find $conf_file -type f -name "*.conf" | while read -r file; do
-        if grep -qE "proxy_pass\\s+(http|https)://$target" "$file"; then 
-          grep -E "^\\s*server_name\\s+" "$file" | awk '{for(i=2;i<=NF;i++) print $i}' | sed 's/;$//'
-        fi
-      done | sort | uniq
-    fi
-    exit 0
-    ;;
-esac
-
-# 主循環
-while true; do
-  conf_file=""
-  domain=""
-  clear
-  show_menu
-  read -r choice
-  case $choice in
+show_menu_nginx(){
+  while true; do
+    conf_file=""
+    domain=""
+    clear
+    show_cert_status
+    echo "-------------------"
+    echo "站點管理器"
+    echo ""
+    echo -e "${YELLOW}i. 安裝 Nginx / OpenResty          r. 解除安裝 Nginx / OpenResty${RESET}"
+    echo ""
+    echo "1. 新增站點           2. 刪除站點"
+    echo ""
+    echo "3. 申請 SSL 證書      4. 刪除 SSL 證書"
+    echo ""
+    echo "5. 切換 Certbot 廠商  6. PHP 管理"
+    echo ""
+    echo "7. 修復Cloudflare 525錯誤    8. MYSQL安裝及管理"
+    echo ""
+    echo "9. Docker安裝及管理"
+    echo ""
+    echo "u. 更新腳本           0. 離開"
+    echo "-------------------"
+    echo -n -e "\033[1;33m請選擇操作 [1-9 / i u 0]: \033[0m"
+    read -r choice
+    case $choice in
     i)
       check_web_environment
       check_nginx
@@ -4310,9 +4384,106 @@ while true; do
       update_script
       ;;
     r)
-      uninstall_nginx
+      uninstall_webserver
       ;;
     *)
       echo "無效選擇。"
-  esac
-done
+    esac
+  done
+}
+case "$1" in
+  --version|-V)
+    echo "站點管理器版本 $version"
+    exit 0
+    ;;
+esac
+
+# 只有不是 --version 或 -V 才會執行以下初始化
+check_system
+check_app
+check_web_environment
+check_webserver_install
+check_and_start_service
+check_web_server
+
+case "$1" in
+  setup)
+    domain="$2"
+    site_type="$3"
+
+    if [[ -z "$domain" || -z "$site_type" ]]; then
+      exit 1
+    fi
+    case "$site_type" in
+      html|flarum|php)
+        setup_site "$domain" $site_type
+        ;;
+      proxy)
+        target_url="$4"
+        target_proto="$5"
+        target_port="$6"
+
+        if [[ -z "$target_url" || -z "$target_proto" || -z "$target_port" ]]; then
+          echo "proxy 類型需要提供 target_url protocol port"
+          exit 1
+        fi
+        
+        # 自動申請 SSL（若不存在）
+        check_cert "$domain" || {
+          echo "未偵測到 Let Encrypt 憑證，嘗試自動申請..."
+          if ssl_apply "$domain"; then
+            echo "申請成功，重新驗證憑證..."
+            check_cert "$domain" || {
+              echo "申請成功但仍無法驗證憑證，中止建立站點"
+              return 1
+            }
+          else
+              echo "SSL 申請失敗，中止建立站點"
+              return 1
+          fi
+        }
+
+        setup_site "$domain" proxy "$target_url" "$target_proto" "$target_port"
+        exit 0
+        ;;
+    esac
+    ;;
+  del)
+    domain="$2"
+    menu_del_sites "$domain"
+    exit 0
+    ;;
+  api)
+    if [[ "$2" == "search" && "$3" == "proxy_domain" ]]; then
+      target="$4"
+      conf_file=$(detect_conf_path)/
+      if [ $caddy -eq 1 ]; then
+        find $conf_file -type f -name "*.conf" | while read -r file; do
+          if grep -qE "reverse_proxy\s+(http|https)://.*$target" "$file"; then 
+            awk -v tgt="$target" '
+            /^[^ \t\n#]/ { 
+                sub(/ \{$/, "");
+                current_domain = $1; 
+            }
+            $0 ~ "reverse_proxy.*" tgt { 
+                if (current_domain != "") print current_domain; 
+            }
+            ' "$file"
+          fi
+        done | sort | uniq
+      else
+        find $conf_file -type f -name "*.conf" | while read -r file; do
+          if grep -qE "proxy_pass\\s+(http|https)://$target" "$file"; then 
+            grep -E "^\\s*server_name\\s+" "$file" | awk '{for(i=2;i<=NF;i++) print $i}' | sed 's/;$//'
+          fi
+        done | sort | uniq
+      fi
+    fi
+    exit 0
+    ;;
+esac
+if [[ $openresty -eq 1 || $nginx -eq 1 ]]; then
+  show_menu_nginx
+elif [ $caddy -eq 1 ]; then
+  show_menu_caddy
+fi
