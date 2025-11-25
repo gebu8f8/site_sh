@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.0.3"
+version="8.0.4"
 
 
 # 顏色定義
@@ -271,32 +271,12 @@ detect_site_type() {
   fi
 }
 
-# 多站型清除備份主函式，$1=wp/flarum，$2=domain，$3=保留份數
-backup_site_type_clean() {
-    local type="$1"
-    local domain="$2"
-    local keep_count="$3"
-    local backup_dir="/opt/wp_backups/$domain"
-    if [[ ! -d "$backup_dir" ]]; then
-        echo -e "${RED}找不到備份目錄：$backup_dir${RESET}"
-        return 1
-    fi
-    if [[ ! "$keep_count" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}保留份數需為數字${RESET}"
-        return 1
-    fi
-    echo "正在清理 $type 備份，只保留最新 $keep_count 份..."
-    find "$backup_dir" -name "backup-*.tar.gz" -type f -printf '%T@ %p\n' | \
-    sort -rn | tail -n +$((keep_count + 1)) | cut -d' ' -f2- | xargs -r rm -f
-    echo -e "${GREEN}清理完成。${RESET}"
-}
-
 # 多站型備份主函式，$1=wp/flarum，$2=domain
 backup_site_type() {
   local type="$1"
   local domain="$2"
   local web_root="/var/www/$domain"
-  local backup_dir="/opt/wp_backups/$domain"
+  local backup_dir="/opt/backups/$domain"
   local timestamp=$(date +"%Y%m%d-%H%M%S")
   local backup_file="$backup_dir/backup-$timestamp.tar.gz"
   mkdir -p "$backup_dir"
@@ -325,13 +305,12 @@ backup_site_type() {
     bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
   fi 
     
-  if ! dba mysql export "$db_name"; then
+  latest_sql_export=$(dba mysql export "$db_name" "$dba_export_dir")
+  if [ $? -ne 0 ]; then
     echo -e "${RED}使用 'dba' 工具備份資料庫失敗！${RESET}"
-    sleep 5
+    sleep 1
     return 1
   fi
-  local latest_sql_export=$(ls -t "${dba_export_dir}/${db_name}"_*.sql 2>/dev/null | head -n1)
-
   if [[ ! -f "$latest_sql_export" ]]; then
     echo -e "${RED}資料庫備份指令執行成功，但在預期目錄中找不到 SQL 檔案！(${dba_export_dir})${RESET}"
     sleep 1
@@ -339,7 +318,7 @@ backup_site_type() {
   fi
 
   echo -e "${GREEN}資料庫已成功匯出至：$latest_sql_export${RESET}"
-  if cp "$latest_sql_export" "$web_root/"; then
+  if ! cp "$latest_sql_export" "$web_root/"; then
     echo -e "${RED}無法複製 SQL 備份檔案，打包中止！${RESET}"
     rm -f "$latest_sql_export" # 清理 dba 生成的原始 sql
     sleep 1
@@ -353,12 +332,52 @@ backup_site_type() {
   echo -e "${GREEN}備份完成！檔案位置：$backup_file${RESET}"
 }
 
-# 主備份流程，支援多站型，清理多餘備份由自動備份排程一併處理
 backup_site() {
-  echo "============【 多站點備份精靈 】============"
-  read -p "請輸入站點 domain（例如 example.com）： " domain
-  [[ -z "$domain" ]] && echo -e "${RED}未輸入 domain，取消備份。${RESET}" && sleep 1&& return 1
+  local conf_dir=$(detect_conf_path)
+  # 取得所有 .conf
+  local raw_files=("$conf_dir"/*.conf)
+  local site_files=()
 
+  # 過濾掉 basename 不含 "." 的
+  for f in "${raw_files[@]}"; do
+    local name=$(basename "$f" .conf)
+    if [[ "$name" == *.* ]]; then
+      site_files+=("$f")
+    fi
+  done
+
+  if [ ${#site_files[@]} -eq 0 ]; then
+    echo -e "${YELLOW}目前沒有任何可備份的站點。${RESET}"
+    return 0
+  fi
+
+  echo "請選擇要備份的站點："
+  local idx=1
+  for f in "${site_files[@]}"; do
+    local name=$(basename "$f" .conf)
+    echo "  $idx) $name"
+    idx=$((idx + 1))
+  done
+
+  echo
+  read -p "請輸入數字：" choice
+
+  # 非數字
+  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}無效的選擇。${RESET}"
+    sleep 1
+    return 1
+  fi
+
+  local max=${#site_files[@]}
+  if (( choice < 1 || choice > max )); then
+    echo -e "${RED}選擇超出範圍。${RESET}"
+    sleep 1
+    return 1
+  fi
+
+  local conf_file="${site_files[$((choice - 1))]}"
+  local domain=$(basename "$conf_file" .conf)
   local web_root="/var/www/$domain"
   local backup_dir="/opt/wp_backups/$domain"
   mkdir -p "$backup_dir"
@@ -367,95 +386,12 @@ backup_site() {
 
   if [[ "$type" == "unknown" ]]; then
     echo -e "${RED}不支援的站點類型，取消備份。${RESET}"
-        return 1
-    fi
+    sleep 1
+    return 1
+  fi
 
-    echo "備份模式選擇："
-    echo "[1] 手動備份一次"
-    echo "[2] 設定每日自動備份"
-    read -p "請輸入選項 [1-2]： " mode_choice
-
-    if [[ "$mode_choice" == "1" ]]; then
-        backup_site_type "$type" "$domain" || return
-        echo
-        echo "是否清理多餘備份？"
-        read -p "保留最新幾份備份檔案？（輸入數字或留空跳過）： " keep_count
-        if [[ "$keep_count" =~ ^[0-9]+$ ]]; then
-            backup_site_type_clean "$type" "$domain" "$keep_count"
-        fi
-    elif [[ "$mode_choice" == "2" ]]; then
-        echo "請輸入自動備份的 crontab 時間格式 (如 '0 3 * * *'、'*/6 * * * *' 等)："
-        read -p "crontab 時間：" cron_time
-        if [[ -z "$cron_time" ]]; then
-            echo -e "${RED}未輸入 crontab 時間，取消設定排程。${RESET}"
-            return 1
-        fi
-        read -p "保留最新幾份備份檔案？（輸入數字，必填）： " keep_count
-        if [[ ! "$keep_count" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}請輸入有效數字。${RESET}"
-            sleep 1
-            return 1
-        fi
-        cron_job="$cron_time bash -c '$(declare -f detect_site_type); $(declare -f backup_site_type); $(declare -f backup_site_type_clean); type=\"$(detect_site_type /var/www/$domain)\"; backup_site_type \"$type\" \"$domain\"; backup_site_type_clean \"$type\" \"$domain\" \"$keep_count\"'"
-        (crontab -l 2>/dev/null | grep -v "$domain"; echo "$cron_job") | crontab -
-        echo -e "${GREEN}已設定自動備份排程（$cron_time），並自動清理多餘備份（只保留最新 $keep_count 份）！${RESET}"
-    else
-        echo -e "${RED}無效選項，取消備份。${RESET}"
-        sleep 1
-        return 1
-    fi
-    echo "============ 備份作業結束 ============"
-}
-
-backup_cron_remove() {
-    echo "============【 移除多站點備份排程 】============"
-
-    # 先讀取所有含有 /var/www 的 crontab 行
-    local cron_list
-    cron_list=$(crontab -l 2>/dev/null | grep "/var/www")
-
-    if [[ -z "$cron_list" ]]; then
-        echo -e "${YELLOW}系統中沒有任何站點備份排程。${RESET}"
-        return 0
-    fi
-
-    echo "目前已設定的站點自動備份排程："
-    echo
-    # 顯示每行，並編號
-    local i=1
-    local domains=()
-    while IFS= read -r line; do
-        # 從 crontab 行找出 domain
-        domain=$(echo "$line" | grep -oP "/var/www/\K[^ /]+" | head -n1)
-        domains+=("$domain")
-        echo "  [$i] $domain"
-        ((i++))
-    done <<< "$cron_list"
-
-    echo
-    read -p "請輸入欲移除排程的序號（或留空取消）： " choice
-
-    if [[ -z "$choice" ]]; then
-        echo -e "${YELLOW} 已取消。${RESET}"
-        return 0
-    fi
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#domains[@]} )); then
-        echo -e "${RED}無效的序號。${RESET}"
-        sleep 1
-        return 1
-    fi
-
-    domain_to_remove="${domains[$((choice-1))]}"
-
-    # 過濾掉該 domain 的 crontab 行
-    new_crontab=$(crontab -l 2>/dev/null | grep -v "/var/www/$domain_to_remove")
-
-    # 寫回 crontab
-    echo "$new_crontab" | crontab -
-
-    echo -e "${GREEN}已移除 $domain_to_remove 的備份排程。${RESET}"
-    echo "============ 移除作業結束 ============"
+  backup_site_type "$type" "$domain" || return 1
+  echo -e "${GREEN}備份作業完成${RESET}"
 }
 
 clean_ssl_session_cache() {
@@ -2497,21 +2433,55 @@ restore_site_files() {
   local mode="$1"
   local domain="$2"
 
-  local dest_dir="/var/www/$domain"
-  read -p "請輸入備份檔路徑 (.tar.gz / .zip)：" archive
+  local default_backup_dir="/opt/wp_backups/$domain"
+  local backup_dir=""
+  local archive=""
 
-  if [[ ! -f "$archive" ]]; then
-    echo -e "${RED}檔案不存在：$archive${RESET}"
+  # 讓使用者輸入或確認備份檔案所在的目錄
+  read -p "請輸入備份檔案所在目錄 [預設: $default_backup_dir]: " backup_dir
+  backup_dir="${backup_dir:-$default_backup_dir}"
+
+  # 檢查目錄是否存在
+  if [[ ! -d "$backup_dir" ]]; then
+    echo -e "${RED}目錄不存在: $backup_dir${RESET}" >&2
     return 1
   fi
 
-  echo -e "${CYAN}準備還原至：$dest_dir${RESET}"
+  # 使用 mapfile 讀取所有 .tar.gz 和 .zip 檔案，並按時間倒序排序
+  mapfile -t backup_files < <(find "$backup_dir" -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.zip" \) -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
 
+  # 檢查是否有找到備份檔
+  if [ ${#backup_files[@]} -eq 0 ]; then
+    echo -e "${YELLOW}在 '$backup_dir' 目錄中找不到任何 .tar.gz 或 .zip 備份檔。${RESET}" >&2
+    return 1
+  fi
+
+  # 列出檔案讓使用者選擇
+  echo -e "${CYAN}在 '$backup_dir' 中找到以下備份檔：${RESET}"
+  for i in "${!backup_files[@]}"; do
+    printf "%3d) %s\n" "$((i + 1))" "$(basename "${backup_files[$i]}")"
+  done
+  read -p "請選擇要還原的檔案編號: " choice
+
+  # 驗證選擇
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#backup_files[@]} )); then
+    echo -e "${RED}無效的選擇。${RESET}" >&2
+    return 1
+  fi
+  archive="${backup_files[$((choice - 1))]}"
+  # === 後續流程不變 ===
+  local dest_dir="/var/www/$domain"
   if [[ -d "$dest_dir" ]]; then
-    read -p "目錄已存在，是否清空目錄後還原？(y/N)：" yn
+    read -p "目錄已存在，是否清空目錄後還原？(y/N): " yn
     case "$yn" in
-      [Yy]* ) rm -rf "$dest_dir"/* ;;
-      * ) echo "已取消還原。"; return 0 ;;
+      [Yy]*) 
+        echo "正在清空 $dest_dir ..."
+        rm -rf "${dest_dir:?}"/* 
+        ;;
+      *) 
+        echo "已取消還原。"
+        return 0 
+        ;;
     esac
   fi
 
@@ -2526,7 +2496,14 @@ restore_site_files() {
     echo -e "${RED}不支援的壓縮格式${RESET}"
     return 1
   fi
-  set_site_permissions $mode $dest_dir
+
+  # 檢查解壓是否成功 (一個簡單的檢查方法是看目錄是否仍為空)
+  if [ -z "$(ls -A "$dest_dir")" ]; then
+      echo -e "${RED}解壓縮失敗或壓縮檔為空！${RESET}"
+      return 1
+  fi
+
+  set_site_permissions "$mode" "$dest_dir"
 
   echo -e "${GREEN}[$mode] 檔案還原完成！${RESET}"
 
@@ -2547,89 +2524,98 @@ restore_site_files() {
 }
 
 restore_site_db() {
-    local type="$1"
-    local domain="$2"
-    local site_path="/var/www/$domain"
-    local db_name=""
-    local db_user=""
-    local db_pass=""
-    local auto_detected_sql_file=""
+  local type="$1"
+  local domain="$2"
+  local site_path="/var/www/$domain"
+  local db_name=""
+  local db_user=""
+  local db_pass=""
+  local sql_to_restore=""
 
-    echo "正在從網站設定檔中讀取資料庫憑證..."
+  # --- 步驟 1: 從設定檔讀取資料庫憑證 (不變) ---
+  if [[ "$type" == "wp" ]]; then
+    local config="$site_path/wp-config.php"
+    db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$config")
+    db_user=$(awk -F"'" '/DB_USER/{print $4}' "$config")
+    db_pass=$(awk -F"'" '/DB_PASSWORD/{print $4}' "$config")
+  elif [[ "$type" == "flarum" ]]; then
+    local config="$site_path/config.php"
+    db_name=$(php -r "\$c = include '$config'; echo \$c['database']['database'] ?? '';")
+    db_user=$(php -r "\$c = include '$config'; echo \$c['database']['username'] ?? '';")
+    db_pass=$(php -r "\$c = include '$config'; echo \$c['database']['password'] ?? '';")
+  fi
 
-    # --- 步驟 1：根據網站類型，安全地讀取資料庫憑證 ---
-    if [[ "$type" == "wp" ]]; then
-        local config="$site_path/wp-config.php"
-        if [[ ! -f "$config" ]]; then
-            echo -e "${RED}錯誤：在 '$site_path' 中找不到 wp-config.php 檔案${RESET}"
-            return 1
-        fi
-        db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$config")
-        db_user=$(awk -F"'" '/DB_USER/{print $4}' "$config")
-        db_pass=$(awk -F"'" '/DB_PASSWORD/{print $4}' "$config")
+  if [[ -z "$db_name" || -z "$db_user" || -z "$db_pass" ]]; then
+    echo -e "${RED}錯誤：無法從設定檔中完整讀取資料庫憑證。${RESET}" >&2
+    return 1
+  fi
 
-    elif [[ "$type" == "flarum" ]]; then
-        local config="$site_path/config.php"
-        # ... (Flarum 的憑證讀取邏輯照舊) ...
-        db_name=$(php -r "\$c = include '$config'; echo \$c['database']['database'] ?? '';")
-        db_user=$(php -r "\$c = include '$config'; echo \$c['database']['username'] ?? '';")
-        db_pass=$(php -r "\$c = include '$config'; echo \$c['database']['password'] ?? '';")
-    else
-        echo -e "${RED}錯誤：不支援的網站類型 '$type'${RESET}"
+  # 確保 dba 工具存在
+  if ! command -v dba >/dev/null 2>&1; then
+    bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
+  fi
+
+  # --- 步驟 2: 智慧地尋找並讓使用者選擇 SQL 檔案 (核心修改) ---
+  local search_dir="$site_path"
+  mapfile -t sql_files < <(find "$search_dir" -maxdepth 1 -type f -name "*.sql" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
+  
+  # 如果在網站根目錄找不到，則詢問使用者
+  if [ ${#sql_files[@]} -eq 0 ] || [[ ! -f "${sql_files[0]}" ]]; then
+    echo -e "${YELLOW}在網站根目錄 '$site_path' 中未找到 .sql 檔案。${RESET}"
+    local default_sql_dir="/root/mysql_backups"
+    read -p "請輸入 .sql 檔案所在的目錄 [預設: $default_sql_dir]: " search_dir
+    search_dir="${search_dir:-$default_sql_dir}"
+
+    if [[ ! -d "$search_dir" ]]; then
+        echo -e "${RED}目錄不存在: $search_dir${RESET}" >&2
         return 1
     fi
+    # 重新在使用者指定的目錄中搜尋
+    mapfile -t sql_files < <(find "$search_dir" -maxdepth 1 -type f -name "*.sql" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
+  fi
 
-    if [[ -z "$db_name" || -z "$db_user" || -z "$db_pass" ]]; then
-        echo -e "${RED}錯誤：無法從設定檔中完整讀取資料庫憑證。${RESET}"
-        return 1
+  # 檢查最終是否找到檔案
+  if [ ${#sql_files[@]} -eq 0 ] || [[ ! -f "${sql_files[0]}" ]]; then
+    echo -e "${RED}錯誤：在 '$search_dir' 目錄中仍然找不到任何 .sql 檔案。${RESET}" >&2
+    return 1
+  fi
+
+  # 讓使用者從找到的檔案列表中選擇
+  if [ ${#sql_files[@]} -gt 1 ]; then
+    echo -e "${CYAN}在 '$search_dir' 中找到以下 SQL 檔案：${RESET}"
+    for i in "${!sql_files[@]}"; do
+      printf "%3d) %s\n" "$((i + 1))" "$(basename "${sql_files[$i]}")"
+    done
+    read -p "請選擇要還原的檔案編號: " choice
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#sql_files[@]} )); then
+      echo -e "${RED}無效的選擇。${RESET}" >&2
+      return 1
     fi
-    echo -e "${GREEN}成功讀取憑據：資料庫名稱: $db_name, 資料庫使用者: $db_user${RESET}"
+    sql_to_restore="${sql_files[$((choice - 1))]}"
+  else
+    # 如果只有一個檔案，就自動選擇，無需使用者操作
+    sql_to_restore="${sql_files[0]}"
+    echo -e "${CYAN}找到唯一的 SQL 備份檔：$(basename "$sql_to_restore")，將自動進行還原...${RESET}"
+  fi
+  
+  echo "您選擇了: $(basename "$sql_to_restore")"
 
-    # --- 步驟 2：檢查並安裝 dba 工具 (如果需要) ---
-    if ! command -v dba >/dev/null 2>&1; then
-        echo "提示：未找到 'dba' 資料庫管理工具，正在嘗試安裝..."
-        bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
-        if ! command -v dba >/dev/null 2>&1; then
-            echo -e "${RED}錯誤：'dba' 工具安裝失敗，無法繼續。${RESET}"
-            return 1
-        fi
+  # --- 步驟 3: 果斷執行還原 ---
+  echo "正在將 '$(basename "$sql_to_restore")' 匯入至資料庫 '$db_name'..."
+
+  if dba mysql import "$db_name" "$db_user" "$db_pass" "$sql_to_restore"; then
+    echo -e "${GREEN}資料庫還原成功！${RESET}"
+    # 只有當 SQL 檔案在網站根目錄時才刪除，避免誤刪 /root/mysql_backups 中的檔案
+    if [[ "$(dirname "$sql_to_restore")" == "$site_path" ]]; then
+        echo "正在清理已還原的 SQL 檔案..."
+        rm -f "$sql_to_restore"
     fi
-
-    local sql_files_in_site_root=("$site_path"/*.sql)
-    if [[ -f "${sql_files_in_site_root[0]}" ]]; then
-        auto_detected_sql_file="${sql_files_in_site_root[0]}"
-        echo -e "${YELLOW}偵測到網站根目錄下存在 SQL 備份檔：$(basename "$auto_detected_sql_file")${RESET}"
-        read -p "是否要立即還原此檔案？[Y/n]: " confirm
-        if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
-            auto_detected_sql_file=""
-        fi
-    fi
-
-    # --- 步驟 4：執行還原 ---
-    local import_cmd="dba mysql import"
-    local success=false
-
-    if [[ -n "$auto_detected_sql_file" ]]; then
-        echo "正在使用自動偵測到的檔案進行還原..."
-        if $import_cmd "$auto_detected_sql_file" "$db_name" "$db_user" "$db_pass"; then
-            success=true
-            rm -f "$auto_detected_sql_file"
-        fi
-    else
-        echo "即將啟動 'dba' 工具的互動式選單..."
-        echo "請在選單中選擇您要還原的 SQL 備份檔案。"
-        if $import_cmd "" "$db_name" "$db_user" "$db_pass"; then
-             success=true
-        fi
-    fi
-
-    # --- 步驟 5：報告結果 ---
-    if $success; then
-        echo -e "${GREEN}資料庫還原流程已成功完成。${RESET}"
-    else
-        echo -e "${RED}資料庫還原流程失敗或被取消。${RESET}"
-        return 1
-    fi
+    return 0
+  else
+    echo -e "${RED}使用 'dba' 工具還原資料庫失敗！請檢查 'dba' 工具的輸出訊息。${RESET}" >&2
+    return 1
+  fi
 }
 
 set_site_permissions() {
@@ -4048,49 +4034,89 @@ done
 }
 
 menu_restore_site() {
-  echo "還原工具"
-  echo ""
-  echo "1. 還原文件(含SQL)"
-  echo ""
-  echo "2. 還原SQL"
-  echo "-------------------"
-  echo "0. 返回"
-  echo -n -e "\033[1;33m請選擇操作 [0-2]: \033[0m"
-  read -r choice
-  case $choice in
-  1)
-    echo "1. WordPress"
-    echo ""
-    echo "2. Flarum"
-    echo -n -e "\033[1;33m請選擇操作 [0-2]: \033[0m"
-    read -r choice
-    case $choice in
+  local domain site_type choice
+
+  echo "--- 網站還原工具 ---"
+  
+  # === 步驟 1: 從 Nginx 設定檔選擇域名 (邏輯內聯) ===
+  local conf_dir
+  conf_dir=$(detect_conf_path)
+  if [ $? -ne 0 ]; then # 假設 detect_conf_path 失敗會回傳非 0
+      echo -e "${RED}無法偵測到 Nginx 設定檔目錄。${RESET}" >&2
+      sleep 1
+      return 1
+  fi
+
+  # 使用 mapfile 結合 find 來安全地處理檔名和過濾
+  mapfile -t site_files < <(find "$conf_dir" -maxdepth 1 -type f -name "*.conf" -exec bash -c 'name=$(basename "$0" .conf); [[ "$name" == *.* ]]' {} \; -print)
+
+  if [ ${#site_files[@]} -eq 0 ]; then
+    echo -e "${YELLOW}目前 Nginx 設定中沒有任何可還原的站點。${RESET}" >&2
+    sleep 1
+    return 1
+  fi
+
+  echo "請選擇要還原的站點："
+  local idx=1
+  for f in "${site_files[@]}"; do
+    local name
+    name=$(basename "$f" .conf)
+    printf "%3d) %s\n" "$idx" "$name"
+    idx=$((idx + 1))
+  done
+
+  read -p "請輸入數字：" choice
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#site_files[@]} )); then
+    echo -e "${RED}無效的選擇。${RESET}" >&2
+    sleep 1
+    return 1
+  fi
+  domain=$(basename "${site_files[$((choice - 1))]}" .conf)
+  echo -e "${CYAN}您選擇了站點: $domain${RESET}"
+  echo
+
+  # === 步驟 2: 選擇網站類型 (邏輯內聯) ===
+  echo "請選擇 '$domain' 的網站類型："
+  echo "  1) WordPress"
+  echo "  2) Flarum"
+  read -p "請輸入數字：" choice
+  
+  case "$choice" in
+    1) site_type="wp" ;;
+    2) site_type="flarum" ;;
+    *)
+      echo -e "${RED}無效的選擇。${RESET}" >&2
+      sleep 1
+      return 1
+      ;;
+  esac
+  echo -e "${CYAN}您選擇了類型: $site_type${RESET}"
+  echo
+
+  # === 步驟 3: 選擇要執行的操作 ===
+  echo "請選擇要對 '$domain' ($site_type) 執行的操作："
+  echo "  1) 還原文件 (包含資料庫)"
+  echo "  2) 僅還原資料庫"
+  echo "  0) 返回"
+  read -p "請輸入數字 [0-2]: " choice
+
+  case "$choice" in
     1)
-      read -p "請輸入需要恢復的域名:" domain
-      restore_site_files wp $domain
+      restore_site_files "$site_type" "$domain"
       ;;
     2)
-      read -p "請輸入需要恢復的域名:" domain
-      restore_site_files flarum $domain
+      restore_site_db "$site_type" "$domain"
       ;;
-    esac
-    ;;
-  2)
-    echo "1. WordPress"
-    echo ""
-    echo "2. Flarum"
-    echo -n -e "\033[1;33m請選擇操作 [0-2]: \033[0m"
-    read -r choice
-    case $choice in
-    1)
-      read -p "請輸入需要恢復的域名:" domain
-      restore_site_db wp $domain
+    0)
+      # 返回
+      return 0
       ;;
-    2)
-      read -p "請輸入需要恢復的域名:" domain
-      restore_site_db flarum $domain
+    *)
+      echo -e "${RED}無效的選擇。${RESET}" >&2
+      sleep 1
+      return 1
       ;;
-    esac
   esac
 }
 
@@ -4193,19 +4219,7 @@ menu_php() {
         httpguard_setup
         ;;
       10)
-        echo "備份工具"
-        echo ""
-        echo "1. 一般備份"
-        echo "2. 移除已設定的自動備份排程"
-        read -p "請選擇[1-2]：" choice
-        case $choice in
-        1)
-          backup_site
-          ;;
-        2)
-          backup_cron_remove
-          ;;
-        esac
+        backup_site
         read -p "操作完成，請按任意鍵繼續..." -n1
         ;;
       11)
