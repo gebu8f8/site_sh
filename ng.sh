@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.0.0"
+version="8.0.3"
 
 
 # 顏色定義
@@ -244,13 +244,26 @@ check_web_server(){
   fi
 }
 
+detect_nginx_conf_paths(){
+  local command=""
+  if [ $openresty -eq 1 ]; then
+    command=openresty
+  elif [ $nginx -eq 1 ]; then
+    command=nginx
+  fi
+  # 執行 nginx/openresty -t 並提取配置文件路徑
+  # 從第二行提取,移除 "nginx: configuration file " 和 " test" 之後的內容
+  local conf_path=$($command -t 2>&1 | sed -n '2s/^nginx: configuration file \(.*\) test.*$/\1/p')
+  
+  echo "$conf_path"
+}
 # WordPress備份
 # 回傳 wp/flarum/unknown
 
 detect_site_type() {
   local web_root="$1"
   if [[ -f "$web_root/wp-config.php" ]]; then
-    echo "wp"
+    echo "wp" 
   elif [[ -f "$web_root/config.php" && -d "$web_root/vendor/flarum" ]]; then
     echo "flarum"
   else
@@ -447,25 +460,18 @@ backup_cron_remove() {
 
 clean_ssl_session_cache() {
   [ $caddy -eq 1 ] && return 0
-  local files
-  local paths=(
-    "/etc/nginx/nginx.conf"
-    "/usr/local/openresty/nginx/conf/nginx.conf"
-  )
-
-  for file in "${paths[@]}"; do
-    if [ -f "$file" ]; then
-      # 先計算未註解的 ssl_session_cache 行數
-      local count_before count_after
-      count_before=$(grep -E '^[[:space:]]*ssl_session_cache' "$file" | wc -l)
-      # 刪除未註解的 ssl_session_cache 行（前面不能有 # 和任意空白）
-      sed -i '/^[[:space:]]*ssl_session_cache[[:space:]]/d' "$file"
-      count_after=$(grep -E '^[[:space:]]*ssl_session_cache' "$file" | wc -l)
-      if [ "$count_before" -gt "$count_after" ]; then
-        echo -e "${GREEN}已清除 $file 中的 ssl_session_cache 設定${RESET}"
-      fi
+  local paths=$(detect_nginx_conf_paths)
+  if [ -f "$paths" ]; then
+    # 先計算未註解的 ssl_session_cache 行數
+    local count_before count_after
+    count_before=$(grep -E '^[[:space:]]*ssl_session_cache' "$paths" | wc -l)
+    # 刪除未註解的 ssl_session_cache 行（前面不能有 # 和任意空白）
+    sed -i '/^[[:space:]]*ssl_session_cache[[:space:]]/d' "$paths"
+    count_after=$(grep -E '^[[:space:]]*ssl_session_cache' "$paths" | wc -l)
+    if [ "$count_before" -gt "$count_after" ]; then
+      echo -e "${GREEN}已清除 $file 中的 ssl_session_cache 設定${RESET}"
     fi
-  done
+  fi
 }
 
 check_http3_support() {
@@ -953,13 +959,14 @@ clean_nginx_ssl_config() {
 default(){
   local mode=$1
   local detect_conf_path=$(detect_conf_path)
+  local ngx_conf=$(detect_nginx_conf_paths)
   create_directories
   generate_ssl_cert
   case "$system" in
   1|2)
     if [ $mode == openresty ]; then
-      rm -f /etc/nginx/nginx.conf
-      wget -O /etc/nginx/nginx.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
+      rm -f $ngx_conf
+      wget -O $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
       id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
     fi
     if [ $mode == caddy ]; then
@@ -978,8 +985,8 @@ default(){
     fi
     # download default
     rm -f $detect_conf_path/default.conf
-    rm -f /etc/nginx/nginx.conf
-    wget -O /etc/nginx/nginx.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
+    rm -f $ngx_conf
+    wget -O $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
     wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     restart_webserver
     ;;
@@ -989,10 +996,8 @@ default(){
 detect_conf_path() {
   local conf=""
   local default_conf_dir=""
-  if command -v openresty >/dev/null 2>&1 ; then
-    conf="/usr/local/openresty/nginx/conf/nginx.conf"
-  elif command -v nginx >/dev/null 2>&1; then
-    conf="/etc/nginx/nginx.conf"
+  if command -v openresty >/dev/null 2>&1 || command -v nginx >/dev/null 2>&1; then
+    conf=$(detect_nginx_conf_paths)
   elif command -v caddy >/dev/null 2>&1; then
     conf="/etc/caddy/Caddyfile"
   fi
@@ -1440,12 +1445,7 @@ generate_ssl_cert(){
 
 get_web_run_user() {
   # --- 1. 偵測 Nginx ---
-  local nginx_conf=""
-  if [ -f /etc/nginx/nginx.conf ]; then
-    nginx_conf="/etc/nginx/nginx.conf"
-  elif [ -f /usr/local/openresty/nginx/conf/nginx.conf ]; then
-    nginx_conf="/usr/local/openresty/nginx/conf/nginx.conf"
-  fi
+  local nginx_conf=$(detect_nginx_conf_paths)
 
   if [ -n "$nginx_conf" ]; then
     # 讀取 user 行，抓第一個 user 名稱，去掉分號
@@ -1504,6 +1504,7 @@ html_sites(){
   echo "已建立 $domain 之html站點。"
 }
 httpguard_setup()(
+  [ $caddy -eq 1 ] && return 0
   check_php
   case $system in
   1|2)
@@ -1512,13 +1513,6 @@ httpguard_setup()(
       read -p "操作完成，請按任意鍵繼續..." -n1
       return 1
     fi
-    if ! openresty -V 2>&1 | grep -iq lua; then
-      echo -e "${RED}您的 OpenResty 不支援 Lua 模組，無法使用 HttpGuard。${RESET}"
-      read -p "操作完成，請按任意鍵繼續..." -n1
-      
-      return 1
-    fi
-    local ngx_conf="/usr/local/openresty/nginx/conf/nginx.conf"
     local guard_dir="/usr/local/openresty/nginx/conf/HttpGuard"
     ;;
   3)
@@ -1532,10 +1526,10 @@ httpguard_setup()(
       read -p "操作完成，請按任意鍵繼續..." -n1
       return 1
     fi
-    local ngx_conf="/etc/nginx/nginx.conf"
     local guard_dir="/etc/nginx/HttpGuard"
     ;;
   esac
+  local ngx_conf=$(detect_nginx_conf_paths)
   if [ -d "$guard_dir" ]; then
     echo "HttpGuard 已安裝，進入管理選單..."
     menu_httpguard
@@ -1592,7 +1586,7 @@ httpguard_setup()(
         lua_shared_dict dict_captcha 128m;\n\
         init_by_lua_file /etc/nginx/HttpGuard/init.lua;\n\
         access_by_lua_file /etc/nginx/HttpGuard/runtime.lua;\n\
-        lua_max_running_timers 1;' /etc/nginx/nginx.conf
+        lua_max_running_timers 1;' "$ngx_conf"
     fi
       
   if nginx -t; then
@@ -2919,99 +2913,109 @@ show_cert_status() (
     echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
     return 0
   fi
-
+    
   echo -e "===== 站點憑證狀態 ====="
-
+    
   if (( BASH_VERSINFO[0] < 4 )); then
       echo "錯誤：此腳本需要 Bash 4.0 或更高版本才能使用關聯陣列。" >&2
       return 1
   fi
-
+    
   # --- 快取相關設定 ---
   local CACHE_DIR="/var/cache/site_manager"
   local NGINX_CACHE_FILE="$CACHE_DIR/nginx_domains.cache"
   mkdir -p "$CACHE_DIR"
-
+    
   local nginx_conf_paths=$(detect_conf_path)
-
+    
   # --- 1. Nginx 配置解析 (帶智慧快取) ---
   declare -A domain_to_cert_path
-
+    
   local nginx_last_mod=0
   [ -d "$nginx_conf_paths" ] && nginx_last_mod=$(stat -c %Y "$nginx_conf_paths")
   local cache_last_mod=0
   [ -f "$NGINX_CACHE_FILE" ] && cache_last_mod=$(stat -c %Y "$NGINX_CACHE_FILE")
-
+    
+  # 判斷是否讀取快取
   if (( cache_last_mod > nginx_last_mod )); then
     while IFS='|' read -r domain cert_path; do
+      # [修復重點 1] 絕對防禦：如果讀到空行或 domain 是空的，立刻跳過
+      [[ -z "$domain" || -z "$cert_path" ]] && continue
       domain_to_cert_path["$domain"]="$cert_path"
     done < "$NGINX_CACHE_FILE"
   else
     local server_configs
+    # 嘗試解析，並過濾掉錯誤訊息
     server_configs=$(awk '/server_name/,/ssl_certificate /' "$nginx_conf_paths"/*.conf 2>/dev/null | grep -E "server_name|ssl_certificate ")
-
+    
     local current_domains=""
     > "$NGINX_CACHE_FILE"
     
-    while IFS= read -r line; do
-      if [[ $line =~ server_name ]]; then
-        current_domains=$(echo "$line" | sed -e 's/server_name//' -e 's/;//' | xargs)
-      elif [[ $line =~ ssl_certificate && -n "$current_domains" ]]; then
-        local cert_path
-        cert_path=$(echo "$line" | awk '{print $2}' | sed 's/;//')
-        for domain in $current_domains; do
-          if [[ "$cert_path" == /etc/letsencrypt/live/* ]]; then
-            domain_to_cert_path["$domain"]="$cert_path"
-            echo "$domain|$cert_path" >> "$NGINX_CACHE_FILE"
+    # 如果 server_configs 是空的，這裡就不會執行，自然安全
+    if [[ -n "$server_configs" ]]; then
+        while IFS= read -r line; do
+          if [[ $line =~ server_name ]]; then
+            current_domains=$(echo "$line" | sed -e 's/server_name//' -e 's/;//' | xargs)
+          elif [[ $line =~ ssl_certificate && -n "$current_domains" ]]; then
+            local cert_path
+            cert_path=$(echo "$line" | awk '{print $2}' | sed 's/;//')
+            for domain in $current_domains; do
+              # [修復重點 2] 只有當 domain 真的是有內容時才寫入陣列
+              if [[ "$cert_path" == /etc/letsencrypt/live/* && -n "$domain" ]]; then
+                domain_to_cert_path["$domain"]="$cert_path"
+                echo "$domain|$cert_path" >> "$NGINX_CACHE_FILE"
+              fi
+            done
+            current_domains=""
           fi
-        done
-        current_domains=""
-      fi
-    done <<< "$server_configs"
+        done <<< "$server_configs"
+    fi
+  fi
+    
+  # --- [修復重點 3] 關鍵檢查：如果上面跑完，陣列裡什麼都沒有，直接結束 ---
+  # 這樣就不會去跑下面的迴圈，避免對空陣列操作報錯
+  if [ ${#domain_to_cert_path[@]} -eq 0 ]; then
+    echo -e "${GREEN}目前沒有偵測到任何使用 Let's Encrypt 的域名。${RESET}"
+    return 0
   fi
 
   # --- 2. 處理憑證資訊 (帶記憶體內 openssl 快取) ---
   declare -A cert_cache 
   declare -A domain_data
-
+    
   local nginx_domains
+  # 因為上面已經檢查過陣列長度不為0，這裡 mapfile 就不會出錯
   mapfile -t nginx_domains < <(printf "%s\n" "${!domain_to_cert_path[@]}" | sort -u)
-
-  if [ ${#nginx_domains[@]} -eq 0 ]; then
-    echo -e "${GREEN}找不到任何設定了 SSL 憑證的域名。${RESET}"
-    return 0
-  fi
-
+    
   for domain in "${nginx_domains[@]}"; do
+    # 再次確認 domain 非空 (雙重保險)
+    [[ -z "$domain" ]] && continue
+
     local cert_path="${domain_to_cert_path[$domain]}"
     local cert_name=$(basename "$(dirname "$cert_path")")
     local note=""
     local end_date=""
+    
+    # 避免 cert_path 為空導致 cert_cache 報錯
+    if [[ -z "$cert_path" ]]; then continue; fi
 
     if [[ -n "${cert_cache[$cert_path]}" ]]; then
       IFS='|' read -r end_date note <<< "${cert_cache[$cert_path]}"
     else
       if [[ -f "$cert_path" ]]; then
-        # *** 核心修改：一次 openssl 呼叫獲取所有需要的資訊 ***
         local cert_info
         cert_info=$(openssl x509 -in "$cert_path" -noout -enddate -issuer 2>/dev/null)
-        
+            
         if [[ -n "$cert_info" ]]; then
           local end_date_raw=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
           end_date=$([[ -n "$end_date_raw" ]] && date -d "$end_date_raw" +"%Y-%m-%d" || echo "無效日期")
-          
-          # *** 新增功能：檢查簽發者 ***
+              
           local issuer
           issuer=$(echo "$cert_info" | grep 'issuer' | sed 's/issuer=//')
-          if [[ ${issuer,,} == *cloudflare* ]]; then # <-- 轉小寫後比較
+          if [[ ${issuer,,} == *cloudflare* ]]; then 
             note="CF 原始憑證"
           fi
-
-          # 舊的備註邏輯可以保留，例如用於非 CF Origin 的其他備註
-          # if [[ -z "$note" ]]; then
-          #   ... 其他備註邏輯 ...
-          # fi
-          
+              
           cert_cache["$cert_path"]="$end_date|$note"
         else
           end_date="讀取失敗"
@@ -3023,10 +3027,8 @@ show_cert_status() (
     fi
     domain_data["$domain"]="$end_date|$cert_name|$note"
   done
-
-  # --- 3. 渲染輸出 (與上一版完全相同，無需修改) ---
-  
-  # --- 排版輔助函式 ---
+    
+  # --- 3. 渲染輸出 ---
   display_width() {
     local str="$1"; local width=0; local i=0
     while [ $i -lt ${#str} ]; do
@@ -3039,14 +3041,14 @@ show_cert_status() (
     local current_width=$(display_width "$text"); local padding=$((max_width - current_width))
     printf "%s%*s" "$text" $padding ""
   }
-
-  # --- 階段一：收集數據並計算各欄位最大寬度 ---
+    
   local headers=("域名" "到期日" "憑證資料夾" "備註")
   local -a max_widths=()
   for header in "${headers[@]}"; do max_widths+=($(display_width "$header")); done
-
+    
   local -a data_rows
   for domain in "${nginx_domains[@]}"; do
+    [[ -z "$domain" ]] && continue
     IFS='|' read -r end_date cert_name note <<< "${domain_data[$domain]}"
     if [ -z "$end_date" ]; then
       end_date="無憑證"; cert_name="-"; note=""
@@ -3058,19 +3060,20 @@ show_cert_status() (
       if [[ $current_width -gt ${max_widths[$i]} ]]; then max_widths[$i]=$current_width; fi
     done
   done
-
-  # --- 階段二：格式化輸出 ---
+    
+  # 顯示表頭
   for i in "${!headers[@]}"; do
     pad_left "${headers[$i]}" "${max_widths[$i]}";
     if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " | "; fi;
   done; printf "\n"
-
+    
   local total_width=0
   for i in "${!max_widths[@]}"; do
     total_width=$((total_width + max_widths[i]));
     if [[ $i -lt $((${#headers[@]} - 1)) ]]; then total_width=$((total_width + 3)); fi;
   done; printf '%.0s-' $(seq 1 $total_width); printf "\n"
-
+    
+  # 顯示資料
   for row in "${data_rows[@]}"; do
     IFS='|' read -r domain date cert note <<< "$row"
     local -a fields=("$domain" "$date" "$cert" "$note")
@@ -3732,7 +3735,7 @@ menu_httpguard(){
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
     5)
-    sed -i '/HttpGuard\/init.lua\|HttpGuard\/runtime.lua\|lua_package_path\|lua_package_cpath\|lua_shared_dict guard_dict\|lua_shared_dict dict_captcha\|lua_max_running_timers/d' /etc/nginx/nginx.conf
+    sed -i '/HttpGuard\/init.lua\|HttpGuard\/runtime.lua\|lua_package_path\|lua_package_cpath\|lua_shared_dict guard_dict\|lua_shared_dict dict_captcha\|lua_max_running_timers/d' "$ngx_conf"
     rm -rf "/etc/nginx/HttpGuard"
     restart_webserver
     echo "HttpGuard 卸載完成。"
@@ -3827,7 +3830,7 @@ menu_del_sites() {
     return 0
   fi
   
-  local site_type=$(detect_site_type "/var/wwe/$domain")
+  local site_type=$(detect_site_type "/var/www/$domain")
   
   # SSL 吊銷
   menu_ssl_revoke "$domain" || {
@@ -3846,8 +3849,6 @@ menu_del_sites() {
     db_name="flarum_${domain//./_}"
   fi
   
-  echo $detect_site_type
-
   if [ $site_type != "unknown" ]; then
     if ! command -v dba >/dev/null 2>&1; then
       bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
@@ -3886,88 +3887,88 @@ menu_ssl_apply() {
 }
 
 menu_ssl_revoke() {
-  [ $caddy -eq 1 ] && return 0
   local cert_dir="/etc/letsencrypt/live"
+  local domain="$1"
 
-  # 找所有憑證資料夾
-  local dirs=("$cert_dir"/*)
-  local domain_list=()
+  if [ -z "$domain" ]; then
+    local conf_dir
+    conf_dir=$(detect_conf_path)
 
-  # 過濾有效的 live domain
-  for d in "${dirs[@]}"; do
-    if [[ -d "$d" ]] && [[ -f "$d/cert.pem" ]]; then
-      domain_list+=("$(basename "$d")")
+    local raw_files=("$conf_dir"/*.conf)
+    local domain_list=()
+    local item
+
+    # 從 conf 抓所有 server_name
+    for f in "${raw_files[@]}"; do
+      while read -r item; do
+        domain_list+=("$item")
+      done < <(grep -hoP 'server_name\s+\K[^;]+' "$f" 2>/dev/null | tr -s ' ' '\n')
+    done
+
+    # 去重
+    readarray -t domain_list < <(printf "%s\n" "${domain_list[@]}" | sort -u)
+
+    if [[ ${#domain_list[@]} -eq 0 ]]; then
+      echo -e "${RED}找不到任何 server_name，無法提供選項。${RESET}"
+      return 1
     fi
-  done
 
-  if [ ${#domain_list[@]} -eq 0 ]; then
-    echo "沒有可吊銷的憑證。"
+    echo "請選擇要吊銷的域名："
+    local idx=1
+    for d in "${domain_list[@]}"; do
+      echo "  $idx) $d"
+      ((idx++))
+    done
+
+    echo
+    read -p "輸入數字：" choice
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#domain_list[@]} )); then
+      echo -e "${RED}無效選擇${RESET}"
+      return 1
+    fi
+
+    domain="${domain_list[$((choice - 1))]}"
+  fi
+  local cert_info
+  if ! cert_info=$(check_cert "$domain"); then
+    echo -e "${RED}憑證檢查失敗: $cert_info${RESET}"
     return 1
   fi
 
-  echo "請選擇要吊銷的憑證："
-  local idx=1
-  for name in "${domain_list[@]}"; do
-    echo "  $idx) $name"
-    idx=$((idx + 1))
-  done
-
-  echo
-  read -p "請輸入數字：" choice
-
-  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-    echo "無效選擇。"
+  local cert_path="/etc/letsencrypt/live/$cert_info/cert.pem"
+  if [ ! -f "$cert_path" ]; then
+    echo -e "${RED}找不到憑證檔案: $cert_path${RESET}"
     return 1
   fi
-
-  if (( choice < 1 || choice > ${#domain_list[@]} )); then
-    echo "超出範圍。"
-    return 1
-  fi
-
-  local cert_info="${domain_list[$((choice - 1))]}"
-  local cert_path="$cert_dir/$cert_info/cert.pem"
 
   openssl x509 -in "$cert_path" -noout -text | grep -A1 "Subject Alternative Name"
   echo
-
-  echo -e "${YELLOW}確定要吊銷 [$cert_info] 嗎？${RESET}(Y/n)"
+  echo "確定要吊銷憑證 [$domain] 嗎？（y/n）"
   read -p "選擇：" confirm
-  confirm=${confirm,,}
-  [[ "$confirm" != "y" && "$confirm" != "" ]] && echo "已取消。" && return 0
+  [[ "$confirm" != "y" ]] && echo "已取消。" && return 0
 
-  # ======= 憑證類型判斷 =======
-
-  # Cloudflare Origin
-  if openssl x509 -in "$cert_path" -noout -subject | grep -qi "CloudFlare Origin Certificate"; then
-    cf_cert_revoke "$cert_info"
-    return $?
+  if openssl x509 -in "$cert_path" -noout -subject | grep -i -q "CloudFlare Origin Certificate"; then
+    cf_cert_revoke "$cert_info" || return 1
+    return 0
   fi
 
-  local issuer=$(openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null)
-  local subject=$(openssl x509 -in "$cert_path" -noout -subject)
+  check_certbot
+  update_certbot
+  
+  certbot revoke --cert-path "$cert_path" --non-interactive --quiet && echo "已吊銷憑證"
 
-  if ! [ "$issuer" = "$subject" ]; then
-    check_certbot
-    update_certbot
+  echo
+  echo "是否刪除憑證檔案 [$cert_info]？（y/n）"
+  read -p "選擇：" delete_choice
 
-    certbot revoke --cert-path "$cert_path" --non-interactive --quiet \
-    && echo -e "${GREEN}吊銷成功。${RESET}"
-  fi
-  read -p "是否刪除憑證檔案 [$cert_info]？(Y/n) " delete_choice
-  delete_choice=${delete_choice,,}
-
-  if [[ "$delete_choice" == "y" || "$delete_choice" == "" ]]; then
+  if [[ "$delete_choice" == "y" ]]; then
     rm -rf "$cert_dir/$cert_info"
     rm -rf "/etc/letsencrypt/archive/$cert_info"
-    rm -rf "/etc/letsencrypt/renewal/$cert_info.conf"
-    echo -e "${GREEN}已刪除憑證資料${RESET}。"
-
-    # 若所有憑證刪光了，移除 cron
-    if [ -z "$(find "$cert_dir" -mindepth 1 -maxdepth 1 -type d)" ]; then
+    rm -f "/etc/letsencrypt/renewal/$cert_info.conf"
+    if [ -z "$(find "$cert_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
       if crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        crontab -l | grep -v "certbot renew" | crontab -
-        echo -e "${GREEN}已移除 certbot 自動續訂。${RESET}"
+        crontab -l 2>/dev/null | grep -v "certbot renew" | crontab -
       fi
     fi
   fi
