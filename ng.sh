@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.0.4"
+version="8.1.1"
 
 
 # 顏色定義
@@ -36,7 +36,6 @@ GREEN="\033[1;32m"   # ✅ 成功用綠色
 YELLOW='\033[1;33m'  # ⚠️ 警告用黃色
 CYAN="\033[1;36m"    # ℹ️ 一般提示用青色
 RESET='\033[0m'      # 清除顏色
-
 
 phpini_path()(
   local php_var=$(check_php_version)
@@ -90,20 +89,29 @@ check_web_environment() {
 
 check_cert() {
   local domain="$1"
-  local cert_dir="/etc/letsencrypt/live"
+  local acme_home="$HOME/.acme.sh"
   
-  [ $caddy -eq 1 ] && return 0
+  # --- 第一階段：極速模式 (修正版) ---
+  if [ -d "$acme_home" ]; then
+    local wildcard_domain="*.${domain#*.}"
+    local found_conf
+    found_conf=$(grep -r -l -e "$domain" -e "$wildcard_domain" "$acme_home" --include="*.conf" 2>/dev/null | head -n 1)
 
-  # 計算網域層級
-  IFS='.' read -ra domain_parts <<< "$domain"
-  local level=${#domain_parts[@]}
-
-  if [ "$level" -ge 6 ]; then
-    echo -e ${RED} "網域層級過多（$level），請檢查輸入是否正確。${RESET}" >&2
-    return 1
+    if [ -n "$found_conf" ]; then
+      local le_domain
+      le_domain=$(grep "^Le_Domain=" "$found_conf" | cut -d= -f2 | tr -d "'")
+      
+      if [ -n "$le_domain" ] && [ -f "/etc/letsencrypt/live/$le_domain/fullchain.pem" ]; then
+        echo "$le_domain"
+        return 0
+      fi
+    fi
   fi
+  
+  # --- 第二階段：相容模式 (保持不變，作為備案) ---
+  local cert_dir="/etc/letsencrypt/live"
+  [ ! -d "$cert_dir" ] && return 1
 
-  # 掃描所有憑證資料夾，逐一分析 SAN
   for dir in "$cert_dir"/*; do
     [ -d "$dir" ] || continue
     local cert_path="$dir/fullchain.pem"
@@ -121,7 +129,6 @@ check_cert() {
     fi
   done
 
-  echo -e "${YELLOW}未找到包含 $domain 的有效憑證${RESET}" >&2
   return 1
 }
 
@@ -318,17 +325,13 @@ backup_site_type() {
   fi
 
   echo -e "${GREEN}資料庫已成功匯出至：$latest_sql_export${RESET}"
-  if ! cp "$latest_sql_export" "$web_root/"; then
-    echo -e "${RED}無法複製 SQL 備份檔案，打包中止！${RESET}"
-    rm -f "$latest_sql_export" # 清理 dba 生成的原始 sql
-    sleep 1
-    return 1
-  fi
-  tar -czf "$backup_file" -C "$web_root" .
-
-  rm -f "$web_root/$(basename "$latest_sql_export")"
+  tar -czf "$backup_file" \
+    --exclude='wp-content/cache' \
+    --exclude='wp-content/updraft' \
+    --exclude='storage/cache' \
+    -C "$web_root" . \
+    -C "$(dirname "$latest_sql_export")" "$(basename "$latest_sql_export")"
   rm -f "$latest_sql_export"
-    
   echo -e "${GREEN}備份完成！檔案位置：$backup_file${RESET}"
 }
 
@@ -447,35 +450,38 @@ check_nginx(){
   fi
 }
 
-check_certbot(){
+check_acme(){
   [ $caddy -eq 1 ] && return 0
-  if command -v certbot >/dev/null 2>&1; then
+  
+  # 【修正】直接檢查執行檔是否存在，這是最可靠的方法
+  if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+    [ -f "$HOME/.acme.sh/acme.sh.env" ] && . "$HOME/.acme.sh/acme.sh.env"
     return 0
   fi
-  case $system in 
-  1)
-    apt update
-    apt install -y snapd
-    snap install core && snap refresh core
-    snap install --classic certbot
-    ln -sf /snap/bin/certbot /usr/bin/certbot
-    snap set certbot trust-plugin-with-root=ok
-    snap install certbot-dns-cloudflare
-    ;;
-  2)
-    dnf install -y python3-pip gcc libffi-devel python3-devel
-    python3 -m pip install --upgrade pip
-    python3 -m pip install --upgrade certbot certbot-nginx certbot-dns-cloudflare certbot-dns-gcore --root-user-action=ignore
-    ln -sf /usr/local/bin/certbot /usr/bin/certbot
-    ;;
-  3) 
-    apk update
-    apk add python3 py3-pip py3-virtualenv gcc musl-dev libffi-dev openssl-dev
-    python3 -m pip install --upgrade pip
-    python3 -m pip install certbot certbot-nginx certbot-dns-cloudflare certbot-dns-gcore --break-system-packages
-    ln -sf /usr/local/bin/certbot /usr/bin/certbot
-    ;;
-  esac
+
+  # --- 如果上面沒找到，才執行安裝 ---
+  local user_email
+  read -p "請輸入您的 Email (用於證書過期通知，可留空自動生成): " user_email
+  # 如果為空，給一個隨機的，避免用你自己的 Email
+  if [ -z "$user_email" ]; then
+    user_email="admin@$(hostname).local"
+    echo "使用默認 Email: $user_email"
+  fi
+  
+  # 執行安裝
+  curl https://get.acme.sh | sh -s email="$user_email"
+  if [ $? -ne 0 ]; then
+    echo -e "${RED}acme.sh 安裝失敗，請檢查網路或 curl。${RESET}"
+    return 1
+  fi
+  
+  # 安裝完後，手動載入一次環境，讓後續指令能立刻生效
+  . "$HOME/.acme.sh/acme.sh.env"
+  ln -s "$HOME/.acme.sh/acme.sh" /usr/local/bin/acme.sh
+  
+  # 設定自動升級與預設 CA
+  acme.sh --upgrade --auto-upgrade
+  acme.sh --set-default-ca --server letsencrypt
 }
 
 check_php(){
@@ -1821,14 +1827,12 @@ EOF
 
 install_wpcli_if_needed() {
   if ! command -v wp >/dev/null 2>&1; then
-    echo "尚未安裝 WP-CLI，開始下載安裝..."
-    curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar || {
+    curl -o /tmp/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar || {
       echo "下載失敗，請檢查網路！"
       return 1
     }
-    chmod +x wp-cli.phar
-    mv wp-cli.phar /usr/local/bin/wp
-    echo "安裝完成，版本：$(wp --allow-root --version | head -n1)"
+    chmod +x /tmp/wp-cli.phar
+    mv /tmp/wp-cli.phar /usr/local/bin/wp
   fi
 }
 
@@ -2769,128 +2773,6 @@ setup_site() {
       ;;
   esac
 }
-
-show_registered_cas() {
-  echo "===== 已註冊憑證機構郵箱如下 ====="
-  local config_file="/ssl_ca/.ssl_ca_emails"
-
-  # 先確保設定檔存在，避免迴圈內重複檢查
-  if [ ! -f "$config_file" ]; then
-    echo "設定檔 $config_file 不存在。"
-    echo "==================================="
-    return 1
-  fi
-
-  for ca in letsencrypt zerossl google; do
-    email=$(awk -v section="[$ca]" '
-      # 當找到我們正在尋找的區塊時，設定 found=1，然後讀取下一行
-      $0 == section { found=1; next }
-      
-      # *** 修正點：使用正確的正則表達式來匹配任何區塊標題 ***
-      # 如果在我們的區塊內讀到下一個區塊標題，就代表我們的區塊結束了
-      /^\[.*\]$/ { found=0 }
-      
-      # 如果 found=1 且該行是以 email= 開頭，就印出值並退出
-      found && /^email=/ { print substr($0,7); exit }
-    ' "$config_file" 2>/dev/null)
-    
-    if [ -n "$email" ]; then
-      echo "$ca：$email"
-    else
-      echo "$ca：未註冊"
-    fi
-  done
-  echo "==================================="
-}
-
-
-select_ca() (
-  mkdir -p /ssl_ca
-  show_registered_cas
-  echo "請選擇你要註冊的憑證簽發機構："
-  echo "1. Let's Encrypt (預設)"
-  echo "2. ZeroSSL"
-  echo "3. Google Trust Services"
-  echo "0. 返回"
-  read -rp "選擇 [0-3]: " ca_choice
-
-  case "$ca_choice" in
-  0)
-    return 0
-    ;;
-  2)
-    echo "請先註冊zeroSSL帳號"
-    echo "接著到這個網址生成EAB Credentials for ACME Clients：https://app.zerossl.com/developer"
-    read -p "您的EAB KID：" eab_kid
-    read -p "您的EAB HMAC Key" eab_key
-    read -p "您的郵箱：" zero_email
-    certbot register \
-      --email $zero_email \
-      --no-eff-email \
-      --agree-tos \
-      --non-interactive \
-      --server "https://acme.zerossl.com/v2/DV90" \
-      --eab-kid "$eab_kid" \
-      --eab-hmac-key "$eab_key"
-    set_ca_email "zerossl" "$zero_email"
-    ;;
-  3)
-    echo "首先你需要有一個google帳號"
-    echo "打開此網址並啟用api，請記得選一個專案：https://console.cloud.google.com/apis/library/publicca.googleapis.com"
-    echo "打開Cloud Shell 並輸入：gcloud beta publicca external-account-keys create"
-    read -p "請輸入keyId：" goog_id
-    read -p "請輸入Key：" goog_eab_key
-    read -p "請輸入您註冊的郵箱" goog_email
-    certbot register \
-      --email "$goog_email" \
-      --no-eff-email \
-      --agree-tos \
-      --non-interactive \
-      --server "https://dv.acme-v02.api.pki.goog/directory" \
-      --eab-kid "$goog_id" \
-      --eab-hmac-key "$goog_eab_key"
-    set_ca_email "google" "$goog_email"
-    ;;
-  *)
-    read -p "請輸入您的郵箱：" le_email
-    certbot register \
-      --email "$le_email" \
-      --no-eff-email \
-      --non-interactive \
-      --agree-tos \
-      --server "https://acme-v02.api.letsencrypt.org/directory"
-    set_ca_email "letsencrypt" "$le_email"
-    ;;
-  esac
-)
-set_ca_email() {
-  local ca_name="$1"
-  local email="$2"
-  local config_file="/ssl_ca/.ssl_ca_emails"
-  local temp_file=$(mktemp)
-
-  mkdir -p /ssl_ca
-  # 確保檔案存在，如果不存在則建立一個空的
-  touch "$config_file"
-
-  # 使用 awk 來安全地移除舊的區塊。
-  # 邏輯：設置一個 'skip' 標記。當遇到目標 [ca_name] 時開始跳過，
-  # 當遇到下一個 [section] 時停止跳過。
-  awk -v ca="[$ca_name]" '
-    BEGIN { skip=0 }
-    $0 == ca { skip=1; next }
-    /^\[.*\]$/ { skip=0 }
-    !skip { print }
-  ' "$config_file" > "$temp_file"
-
-  # 將新的 CA 資訊追加到臨時檔案的末尾
-  # 初始模板中所有 email 都為空，所以不需要特殊處理初始情況
-  echo -e "[$ca_name]\nemail=$email\n" >> "$temp_file"
-
-  # 用處理過的新檔案覆蓋舊檔案
-  mv "$temp_file" "$config_file"
-}
-
 show_cert_status() (
   # 在子 Shell 中執行
   check_web_environment
@@ -3197,207 +3079,160 @@ show_php() {
   done
 }
 
-ssl_apply() (
-  update_certbot
-  mkdir -p /ssl_ca
-
-  # 將常用變數宣告在最前面
+ssl_apply() {
+  check_acme
+  # --- 1. 處理域名與路徑 ---
   local domains="$1"
-  local selected_ca selected_email server_url auth_method
-  local cred_file reload_cmd
-  local -A ca_emails
-  local -a domain_args certbot_args # 使用陣列來動態建立 certbot 命令
-  local needs_auto_renew=0 # 標記是否需要加入自動續訂
   if [ -z "$domains" ]; then
     read -p "請輸入您的域名（只能用空白鍵分隔）：" domains
   fi
   
-  # 將域名字串轉換為 certbot 的 -d 參數陣列
+  # 陣列轉換 (處理逗號或空格)
   IFS=$' ,\n' read -ra domain_array <<< "$domains"
+  
+  # 找出主域名 (非泛域名優先)
+  local main_domain=""
+  local non_wildcard_found=0
+  for d in "${domain_array[@]}"; do
+    if [[ "$d" != "*."* ]]; then
+      main_domain="$d"
+      non_wildcard_found=1
+      break
+    fi
+  done
+  # 如果全是泛域名，取第一個
+  [ $non_wildcard_found -eq 0 ] && main_domain="${domain_array[0]}"
+  
+  # 準備目標目錄
+  local cert_dir_name=""
+  if [[ "$main_domain" == "*."* ]]; then
+    cert_dir_name="${main_domain#*.}"
+  else
+    cert_dir_name="$main_domain"
+  fi
+  
+  local target_dir="/etc/letsencrypt/live/$cert_dir_name"
+
+  # 準備 acme.sh 參數 (-d domain1 -d domain2 ...)
+  local -a domain_args=()
   for d in "${domain_array[@]}"; do
     domain_args+=("-d" "$d")
   done
-  # (此段邏輯已相當清晰，僅微調)
-  local current_ca_config="/ssl_ca/.ssl_ca_emails"
-  if [ -f "$current_ca_config" ]; then
-    local current_ca=""
-    while IFS="=" read -r key val; do
-      if [[ $key =~ ^\[(.*)\]$ ]]; then
-        current_ca="${BASH_REMATCH[1]}"
-      elif [[ -n "$current_ca" && $key == "email" && -n "$val" ]]; then
-        ca_emails["$current_ca"]="$val"
-      fi
-    done < "$current_ca_config"
-  fi
 
-  local ca_options=()
-  for ca in letsencrypt zerossl google; do
-    [ -n "${ca_emails[$ca]}" ] && ca_options+=("$ca")
-  done
-
-  if [ ${#ca_options[@]} -eq 0 ]; then
-    echo "尚未註冊任何憑證簽發機構，請直接輸入電子郵件。"
-    selected_ca="letsencrypt"
-    read -p "請輸入電子郵件：" selected_email
-    certbot register --email "$selected_email" --non-interactive --agree-tos --no-eff-email --server "https://acme-v02.api.letsencrypt.org/directory"
-    set_ca_email "letsencrypt" "$selected_email"
-  elif [ ${#ca_options[@]} -eq 1 ]; then
-    selected_ca="${ca_options[0]}"
-    echo "自動選擇已註冊的 CA：$selected_ca（${ca_emails[$selected_ca]}）"
-    selected_email="${ca_emails[$selected_ca]}"
-  else
-    echo "偵測到以下已註冊的 CA："
-    for i in "${!ca_options[@]}"; do
-      echo "$((i+1))) ${ca_options[$i]}（${ca_emails[${ca_options[$i]}]}）"
-    done
-    read -p "請選擇您要使用的 CA [1-${#ca_options[@]}]（預設 1）：" choice
-    selected_ca="${ca_options[$((choice-1))]}"
-    selected_email="${ca_emails[$selected_ca]}"
-  fi
-  case "$selected_ca" in
-    zerossl) 
-    server_url="https://acme.zerossl.com/v2/DV90"
-    ;;
-    google)
-    server_url="https://dv.acme-v02.api.pki.goog/directory"
-    ;;
-    *) 
-    server_url="https://acme-v02.api.letsencrypt.org/directory" 
-    ;;
-  esac
-  
-  certbot_args=(
-    certonly
-    --email "$selected_email"
-    --agree-tos
-    --key-type rsa
-    --server "$server_url"
-    --non-interactive
-    "${domain_args[@]}"
-  )
-  
+  # --- 2. 選擇驗證方式 ---
   echo "選擇驗證方式："
-  echo "1) DNS (Cloudflare) "
-  echo "2) DNS (其他供應商) "
-  echo "3) DNS (CNAME橋接)"
-  echo "4) HTTP"
-  read -p "選擇 [1-4]（預設 3）:" auth_method
+  echo "1) DNS API (Cloudflare、DNSPod、Aliyun)"
+  echo "2) DNS Manual (手動添加 TXT)"
+  echo "3) HTTP (網站目錄驗證)"
+  read -p "選擇 [1-3]（預設 3）:" auth_method
   auth_method="${auth_method:-3}"
 
   case "$auth_method" in
-  1) # DNS (Cloudflare)
-    cred_file="/ssl_ca/cloudflare/cloudflare.ini"
-    if [ ! -f "$cred_file" ]; then
-      mkdir -p /ssl_ca/cloudflare
-      read -s -p "請輸入您的 Cloudflare API Token (非Global API Key)：" cf_token
-      echo "dns_cloudflare_api_token = $cf_token" > "$cred_file"
-      chmod 600 "$cred_file"
-    fi
-    certbot_args+=(
-      --dns-cloudflare
-      --dns-cloudflare-credentials "$cred_file"
-      --dns-cloudflare-propagation-seconds 60
-    )
-    needs_auto_renew=1
-    ;;
-  2) # DNS (其他供應商)
-    read -p  "此DNS驗證方式不支援自動續訂，是否繼續? (y/n)" continue_choice
-    [[ ! "$continue_choice" =~ ^[Yy]$ ]] && { echo "已取消操作。"; return 1; }
-    local temp_args=()
-    for arg in "${certbot_args[@]}"; do
-      if [[ "$arg" != "--non-interactive" ]]; then
-        temp_args+=("$arg")
-      fi
-    done
-    # 用過濾後的陣列覆蓋原始陣列
-    certbot_args=("${temp_args[@]}")
-    certbot_args+=(--manual --preferred-challenges "dns-01")
-    ;;
-  3) # DNS (CNAME橋接)
-    local base_domain=""
-    if [ "${#domain_array[@]}" -eq 1 ]; then
-      base_domain="${domain_array[0]/\*./}"
-    elif [ "${#domain_array[@]}" -eq 2 ] && [[ "${domain_array[0]}" == "*."*"${domain_array[1]}" || "${domain_array[1]}" == "*."*"${domain_array[0]}" ]]; then
-        base_domain=$([ ${#domain_array[0]} -lt ${#domain_array[1]} ] && echo "${domain_array[0]}" || echo "${domain_array[1]}")
-    else
-      echo -e "${RED}域名數量或組合無效。此模式僅支援單一域名或一對匹配的根域名與萬用字元域名。${RESET}" >&2; return 1
-    fi
+  1) # DNS API
+    ACME_CONF="$HOME/.acme.sh/account.conf"
+    
+    echo "請選擇 DNS 服務商："
+    echo "  1) Cloudflare"
+    echo "  2) DNSPod.cn"
+    echo "  3) Aliyun"
+    read -p "請選擇 [1-3]：" dns_num
 
-    local RANDOM_PART=$(head /dev/urandom | tr -dc a-z0-9 | head -c 10)
-    local CNAME_TARGET="$RANDOM_PART.ssl.gebu8f.de"
-      
-    echo "請新增 CNAME 記錄: _acme-challenge.$base_domain CNAME $CNAME_TARGET"
-    read -p "新增完成後請按任意鍵繼續..." -n1
-      
-    local success=0
-    for i in {1..12}; do
-      echo -n "第 $i 次檢查中... "
-      cname=$(dig +short CNAME "_acme-challenge.$base_domain" @1.1.1.1 | sed 's/\.$//')
-      if [ "$cname" = "$CNAME_TARGET" ]; then
-        echo -e "${GREEN}驗證成功!${RESET}"; success=1; break
-      fi
-      sleep 10
-    done
-    [ $success -ne 1 ] && { echo -e "${RED}驗證失敗。${RESET}" >&2; return 1; }
-      
-    mkdir -p "/opt/certbot-hook"
-    [ ! -f /opt/certbot-hook/cf-hook.sh ] && wget -q -O /opt/certbot-hook/cf-hook.sh https://files.gebu8f.com/files/cf-hook.sh && chmod +x /opt/certbot-hook/cf-hook.sh
-      
-    certbot_args+=(
-      --manual
-      --preferred-challenges "dns-01"
-      --reuse-key
-      --manual-auth-hook "/opt/certbot-hook/cf-hook.sh add_TXT $CNAME_TARGET"
-      --manual-cleanup-hook "/opt/certbot-hook/cf-hook.sh del_TXT"
-    )
-    needs_auto_renew=1
-    ;;
-  4) # HTTP
-    [[ "$domains" =~ \*\. ]] && echo "HTTP驗證不支援萬用字元域名。" >&2 && sleep 1; return 1
-    if [ "$selected_ca" = "google" ]; then
-      echo "Google CA 不支援 HTTP 驗證。" >&2; return 1
+    local dns_plugin=""
+    local check_key=""
+    local extra_tip=""
+    local -a input_vars=()
+    local -a input_prompts=()
+    
+    case $dns_num in
+    1)
+      dns_plugin="dns_cf"
+      check_key="SAVED_CF_Token"
+      input_vars=("CF_Token" "CF_Account_ID")
+      input_prompts=("請輸入 Cloudflare API Token" "請輸入 Cloudflare Account ID")
+      ;;
+    2)
+      dns_plugin="dns_dp"
+      check_key="SAVED_DP_Id"
+      input_vars=("DP_Id" "DP_Key")
+      input_prompts=("請輸入 DNSPod ID" "請輸入 DNSPod Key")
+      ;;
+    3)
+      dns_plugin="dns_ali"
+      check_key="SAVED_Ali_Key"
+      extra_tip="提示：請至 RAM 控制台獲取 AccessKey (https://ram.console.aliyun.com/users)"
+      input_vars=("Ali_Key" "Ali_Secret")
+      input_prompts=("請輸入 Aliyun AccessKey ID" "請輸入 Aliyun AccessKey Secret")
+      ;;
+    *) echo -e "${RED}無效選擇${RESET}"; return 1 ;;
+    esac
+
+    # 通用檢查與輸入邏輯
+    if [ ! -f "$ACME_CONF" ] || ! grep -q "$check_key" "$ACME_CONF"; then
+      echo
+      [ -n "$extra_tip" ] && echo -e "${YELLOW}${extra_tip}${RESET}"
+      echo -e "${YELLOW}未檢測到 $dns_plugin 的憑證，請輸入：${RESET}"
+      for ((i=0; i<${#input_vars[@]}; i++)); do
+        echo
+        read -s -p "${input_prompts[$i]}： " user_input
+        echo
+        export "${input_vars[$i]}=$user_input"
+      done
     fi
-    [ ! -f /opt/certbot-hook/open_port.sh ] && wget -q -O /opt/certbot-hook/open_port.sh https://gitlab.com/gebu8f/sh/-/raw/main/nginx/open_port.sh && chmod +x /opt/certbot-hook/open_port.sh
-      /opt/certbot-hook/open_port.sh add 80
+    acme.sh --issue --dns "$dns_plugin" "${domain_args[@]}" || return 1
+    ;;
+
+  2) # DNS Manual
+    read -p "此方式不支援自動續訂，是否繼續? (y/n) " continue_choice
+    [[ ! "$continue_choice" =~ ^[Yy]$ ]] && { echo "已取消。"; return 0; }
+    
+    # 第一步：獲取 TXT 記錄
+    acme.sh --issue --dns "${domain_args[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please
+    
+    echo -e "\n${YELLOW}請去 DNS 後台添加上述 TXT 記錄。${RESET}"
+    read -p "添加完成後，請按任意鍵繼續驗證..." -n1
+    
+    # 第二步：驗證
+    acme.sh --renew "${domain_args[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please || return 1
+    ;;
+
+  3) # HTTP
+    [[ "$domains" =~ \*\. ]] && echo "HTTP驗證不支援萬用字元域名。" >&2 && return 1
+    
     local detect_conf_path=$(detect_conf_path)
     mkdir -p /var/www/acme
-    wget -O "$detect_conf_path/acme.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_http.conf
-    sed -i "s|domain|$domains|g" "$detect_conf_path/acme.conf"
+    
+    # 下載模板
+    wget -O "$detect_conf_path/acme.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_http.conf || { echo "下載模板失敗"; return 1; }
+    
+    # 轉換陣列為空格分隔字串，確保 Nginx 語法正確
+    local nginx_domains="${domain_array[*]}"
+    sed -i "s|domain|$nginx_domains|g" "$detect_conf_path/acme.conf"
+    
     restart_webserver
-    certbot_args+=(--webroot --webroot-path /var/www/acme)
-    # 執行後的清理工作
-    trap 'rm -f "$detect_conf_path/acme.conf"; /opt/certbot-hook/open_port.sh del 80; restart_webserver' RETURN
-    needs_auto_renew=2
+    
+    # 執行驗證
+    acme.sh --issue "${domain_args[@]}" -w /var/www/acme
+    local ret=$? # 記錄結果
+    
+    # 清理並恢復
+    rm -f "$detect_conf_path/acme.conf"
+    restart_webserver
+    
+    # 如果驗證失敗，中斷流程
+    [ $ret -ne 0 ] && return 1
     ;;
-  *)
-    echo "無效的選擇。" >&2
-    return 1
-    ;;
+    
+  *) echo "無效的選擇。" >&2; return 1 ;;
   esac
-  if ! certbot "${certbot_args[@]}"; then
-    echo -e "${RED}SSL 憑證申請失敗。${RESET}" >&2
-    return 1
-  fi
-  echo -e "${GREEN}SSL 憑證申請成功！${RESET}"
-  if [ "$needs_auto_renew" -gt 0 ]; then
-    local cron_command="certbot renew --quiet"
-    if [ "$needs_auto_renew" -eq 2 ]; then # 處理 HTTP 驗證的 hook
-      mkdir -p /opt/certbot-hook
-      [ ! -f /opt/certbot-hook/certbot_post.sh] && wget -q -O /opt/certbot-hook/certbot_post.sh https://gitlab.com/gebu8f/sh/-/raw/main/nginx/certbot_post.sh && chmod +x /opt/certbot-hook/certbot_post.sh
-      cron_command+=" --pre-hook \"/opt/certbot-hook/certbot_post.sh add\" --post-hook \"/opt/certbot-hook/certbot_post.sh del\""
-    fi
-    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-      (crontab -l 2>/dev/null; echo "0 3 * * * $cron_command") | crontab -
-      echo "已加入自動續訂任務。"
-    fi
-    # 啟用 crond 服務
-    case $system in
-      1) systemctl enable --now cron ;;
-      2) systemctl enable --now crond ;;
-      3) rc-update add crond default && rc-service crond start ;;
-    esac
-  fi
-)
+
+  mkdir -p "$target_dir"
+  acme.sh --install-cert -d "$main_domain" \
+    --fullchain-file "$target_dir/fullchain.pem" \
+    --key-file       "$target_dir/privkey.pem" \
+    --reloadcmd      "service openresty restart 2>/dev/null || service nginx restart 2>/dev/null"
+
+  echo -e "${GREEN}證書申請與安裝完成！${RESET}"
+}
 
 toggle_httpguard_module() {
   local module_name=$1
@@ -3448,19 +3283,6 @@ toggle_httpguard_module() {
   fi
 }
 
-update_certbot(){
-  case $system in
-    1)
-      snap refresh certbot > /dev/null 2>&1
-      ;;
-    2)
-      python3 -m pip install --upgrade certbot certbot-nginx certbot-dns-cloudflare --break-system-packages > /dev/null 2>&1
-      ;;
-    3)
-      python3 -m pip install --upgrade certbot certbot-nginx certbot-dns-cloudflare --break-system-packages > /dev/null 2>&1
-      ;;
-  esac
-}
 update_script() {
   local download_url="https://gitlab.com/gebu8f/sh/-/raw/main/nginx/ng.sh"
   local temp_path="/tmp/ng.sh"
@@ -3571,14 +3393,10 @@ uninstall_webserver(){
 
 wordpress_site() {
   local MY_IP=$(curl -s https://api64.ipify.org)
-  local HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" --max-time 3 https://wordpress.org)
   local ngx_user=$(get_web_run_user)
 
-  if [[ "$HTTP_CODE" == "200" ]]; then
-    echo "您的IP地址支持訪問 WordPress。"
-  else
+  if ! curl -s --connect-timeout 3 https://wordpress.org >/dev/null; then
     echo "您的IP地址不支持訪問 WordPress。"
-  # 如果IP看起來像IPv6格式(簡單判斷包含冒號)
     if [[ "$MY_IP" == *:* ]]; then
       echo "您目前是 IPv6，請使用 WARP 等方式將流量轉為 IPv4 以正常訪問 WordPress。"
     fi
@@ -3630,6 +3448,17 @@ wordpress_site() {
   sed -i "s/username_here/$db_user/" "/var/www/$domain/wp-config.php"
   sed -i "s/password_here/$db_pass/" "/var/www/$domain/wp-config.php"
   sed -i "s/localhost/localhost/" "/var/www/$domain/wp-config.php"
+  # 安全金鑰
+  if command -v wp >/dev/null 2>&1; then
+    wp config shuffle-salts --path="/var/www/$domain" --allow-root
+  else
+    curl -s https://api.wordpress.org/secret-key/1.1/salt/ > /tmp/wp_salts.txt
+    sed -i "/define.*'AUTH_KEY'/i WP_SALTS" "/var/www/$domain/wp-config.php"
+    sed -i "/put your unique phrase here/d" "/var/www/$domain/wp-config.php"
+    sed -i "/WP_SALTS/r /tmp/wp_salts.txt" "/var/www/$domain/wp-config.php"
+    sed -i "/WP_SALTS/d" "/var/www/$domain/wp-config.php"
+    rm -f /tmp/wp_salts.txt
+  fi
   # 設定權限
   chown -R $ngx_user:$ngx_user "/var/www/$domain"
   setup_site "$domain" php
@@ -3684,6 +3513,44 @@ self_signed_certificate()(
 
 
 # 菜單
+
+menu_reset_dns_token() {
+  local ACME_CONF="$HOME/.acme.sh/account.conf"
+  
+  if [ ! -f "$ACME_CONF" ]; then
+    echo -e "${RED}尚未有任何 acme.sh 設定檔。${RESET}"
+    return 1
+  fi
+
+  echo "請選擇要重置（清除）的 DNS 憑證："
+  echo "  1) Cloudflare"
+  echo "  2) DNSPod.cn"
+  echo "  3) Aliyun"
+  read -p "請選擇：" choice
+
+  case $choice in
+    1)
+      # 使用 sed 刪除包含特定關鍵字的行
+      # SAVED_CF_Token 和 SAVED_CF_Account_ID
+      sed -i "/SAVED_CF_/d" "$ACME_CONF"
+      echo -e "${GREEN}Cloudflare 憑證已清除。${RESET}"
+      echo "下次申請證書時，系統將會提示您輸入新的 Token。"
+      ;;
+    2)
+      sed -i "/SAVED_DP_/d" "$ACME_CONF"
+      echo -e "${GREEN}DNSPod 憑證已清除。${RESET}"
+      echo "下次申請證書時，系統將會提示您輸入新的 ID/Key。"
+      ;;
+    3)
+      sed -i "/SAVED_Ali_/d" "$ACME_CONF"
+      echo -e "${GREEN}Aliyun 憑證已清除。${RESET}"
+      echo "下次申請證書時，系統將會提示您輸入新的 AccessKey。"
+      ;;
+    *)
+      echo -e "${RED}無效選擇${RESET}"
+      ;;
+  esac
+}
 
 menu_httpguard(){
   clear
@@ -3850,7 +3717,7 @@ menu_ssl_apply() {
   [ $caddy -eq 1 ] && return 0
   echo "SSL 申請"
   echo "-------------------"
-  echo "1. Certbot(Let's Encrypt、ZeroSSL、Google) 憑證"
+  echo "1. acme(Let's Encrypt) 憑證"
   echo ""
   echo "2. Cloudflare 原始憑證"
   echo ""
@@ -3874,32 +3741,20 @@ menu_ssl_apply() {
 
 menu_ssl_revoke() {
   local cert_dir="/etc/letsencrypt/live"
-  local domain="$1"
+  local domain_to_check="$1"
 
-  if [ -z "$domain" ]; then
-    local conf_dir
-    conf_dir=$(detect_conf_path)
-
-    local raw_files=("$conf_dir"/*.conf)
-    local domain_list=()
-    local item
-
-    # 從 conf 抓所有 server_name
-    for f in "${raw_files[@]}"; do
-      while read -r item; do
-        domain_list+=("$item")
-      done < <(grep -hoP 'server_name\s+\K[^;]+' "$f" 2>/dev/null | tr -s ' ' '\n')
-    done
-
-    # 去重
-    readarray -t domain_list < <(printf "%s\n" "${domain_list[@]}" | sort -u)
-
-    if [[ ${#domain_list[@]} -eq 0 ]]; then
-      echo -e "${RED}找不到任何 server_name，無法提供選項。${RESET}"
+  if [ -z "$domain_to_check" ]; then
+    if [ ! -d "$cert_dir" ] || [ -z "$(find "$cert_dir" -mindepth 1 -maxdepth 1 -type d)" ]; then
+      echo -e "${RED}錯誤：找不到任何已安裝的證書。${RESET}"
       return 1
     fi
+    
+    local domain_list=()
+    for dir in "$cert_dir"/*; do
+      [ -d "$dir" ] && domain_list+=("$(basename "$dir")")
+    done
 
-    echo "請選擇要吊銷的域名："
+    echo "請選擇要操作的證書 (Certificate Name)："
     local idx=1
     for d in "${domain_list[@]}"; do
       echo "  $idx) $d"
@@ -3907,58 +3762,83 @@ menu_ssl_revoke() {
     done
 
     echo
-    read -p "輸入數字：" choice
+    read -p "請輸入數字：" choice
 
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#domain_list[@]} )); then
-      echo -e "${RED}無效選擇${RESET}"
+      echo -e "${RED}無效的選擇。${RESET}"
       return 1
     fi
-
-    domain="${domain_list[$((choice - 1))]}"
+    domain_to_check="${domain_list[$((choice - 1))]}"
   fi
+
   local cert_info
-  if ! cert_info=$(check_cert "$domain"); then
-    echo -e "${RED}憑證檢查失敗: $cert_info${RESET}"
+  if ! cert_info=$(check_cert "$domain_to_check"); then
+    echo -e "${RED}錯誤：無法在系統中找到與 '$domain_to_check' 相關的有效證書。${RESET}"
     return 1
   fi
-
-  local cert_path="/etc/letsencrypt/live/$cert_info/cert.pem"
+  
+  local cert_path="/etc/letsencrypt/live/$cert_info/fullchain.pem"
   if [ ! -f "$cert_path" ]; then
-    echo -e "${RED}找不到憑證檔案: $cert_path${RESET}"
+    echo -e "${RED}錯誤：找不到證書檔案: $cert_path${RESET}"
     return 1
   fi
 
+  # --- 3. 顯示資訊並確認操作 ---
+  echo -e "\n${CYAN}--- 證書資訊 ---${RESET}"
   openssl x509 -in "$cert_path" -noout -text | grep -A1 "Subject Alternative Name"
+  echo -e "${YELLOW}你將要操作的證書是: ${RESET}${GREEN}${cert_info}${RESET}"
   echo
-  echo "確定要吊銷憑證 [$domain] 嗎？（y/n）"
-  read -p "選擇：" confirm
-  [[ "$confirm" != "y" ]] && echo "已取消。" && return 0
+  read -p "確定要停止自動續訂此證書嗎？[y/n]: " confirm
+  [[ "$confirm" != "y" ]] && echo "操作已取消。" && return 0
 
+  # --- 4. 處理特殊 Cloudflare Origin Cert (保持你原本的邏輯) ---
   if openssl x509 -in "$cert_path" -noout -subject | grep -i -q "CloudFlare Origin Certificate"; then
     cf_cert_revoke "$cert_info" || return 1
     return 0
   fi
 
-  check_certbot
-  update_certbot
+  local managed_by_acme=0
   
-  certbot revoke --cert-path "$cert_path" --non-interactive --quiet && echo "已吊銷憑證"
-
-  echo
-  echo "是否刪除憑證檔案 [$cert_info]？（y/n）"
-  read -p "選擇：" delete_choice
-
-  if [[ "$delete_choice" == "y" ]]; then
-    rm -rf "$cert_dir/$cert_info"
-    rm -rf "/etc/letsencrypt/archive/$cert_info"
-    rm -f "/etc/letsencrypt/renewal/$cert_info.conf"
-    if [ -z "$(find "$cert_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)" ]; then
-      if crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        crontab -l 2>/dev/null | grep -v "certbot renew" | crontab -
-      fi
+  # 優先嘗試 acme.sh
+  if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+    # 載入環境，防止找不到指令
+    [ -f "$HOME/.acme.sh/acme.sh.env" ] && . "$HOME/.acme.sh/acme.sh.env"
+    
+    # acme.sh 會自動判斷 ECC/RSA
+    if acme.sh --remove -d "$cert_info" --yes &>/dev/null; then
+       echo -e "${GREEN}acme.sh: 已成功從續期列表中移除 '$cert_info'。${RESET}"
+       managed_by_acme=1
     fi
   fi
+  
+  # 如果 acme.sh 沒管理此證書，或者沒裝，則嘗試 Certbot
+  if [ $managed_by_acme -eq 0 ] && command -v certbot &>/dev/null; then
+    if certbot certificates 2>/dev/null | grep -q "Certificate Name: $cert_info"; then
+       # certbot delete 會同時停止續期並刪除檔案
+      certbot delete --cert-name "$cert_info" --non-interactive
+      echo -e "${GREEN}Certbot: 已刪除證書 '$cert_info'。${RESET}"
+    fi
+  fi
+
+  echo
+  read -p "是否徹底刪除磁碟上的所有相關檔案？(這將刪除 /etc/letsencrypt/ 下的檔案) [y/N，預設:N]: " confirm_delete
+  confirm_delete=${confirm_delete,,}
+  confirm_delete=${confirm_delete:-n}
+  
+  if [ "$confirm_delete" == "y" ]; then
+    echo "正在刪除檔案..."
+    rm -rf "/etc/letsencrypt/live/$cert_info"
+    rm -rf "/etc/letsencrypt/archive/$cert_info"
+    rm -f "/etc/letsencrypt/renewal/$cert_info.conf"
+    
+    if [ $managed_by_acme -eq 1 ]; then
+        rm -rf "$HOME/.acme.sh/${cert_info}_ecc"
+        rm -rf "$HOME/.acme.sh/${cert_info}"
+    fi
+    echo -e "${GREEN}檔案刪除完成。${RESET}"
+  fi
 }
+
 menu_wp(){
   while true; do
   clear
@@ -4146,11 +4026,13 @@ menu_php() {
     read -r choice
     case $choice in
       1)
-        clear
-        php_install
-        sleep 5
-        php_fix
-        read -p "操作完成，請按任意鍵繼續..." -n1
+        if ! command -v php >/dev/null 2>&1; then
+          clear
+          php_install
+          sleep 5
+          php_fix
+          read -p "操作完成，請按任意鍵繼續..." -n1
+        fi
         ;;
       2) 
         clear
@@ -4326,7 +4208,7 @@ show_menu_nginx(){
     echo ""
     echo "3. 申請 SSL 證書      4. 刪除 SSL 證書"
     echo ""
-    echo "5. 切換 Certbot 廠商  6. PHP 管理"
+    echo "5. 重置 DNS 憑證      6. PHP 管理"
     echo ""
     echo "7. 修復Cloudflare 525錯誤    8. MYSQL安裝及管理"
     echo ""
@@ -4361,9 +4243,8 @@ show_menu_nginx(){
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
     5)
-      check_certbot
-      update_certbot
-      select_ca
+      menu_reset_dns_token
+      sleep 5
       ;;
     6)
       check_no_ngx || continue
