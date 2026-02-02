@@ -9,8 +9,8 @@ if [ "$(id -u)" -ne 0 ]; then
     install_sudo_cmd=""
     if command -v apt >/dev/null 2>&1; then
       install_sudo_cmd="apt-get update && apt-get install -y sudo"
-    elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
-      install_sudo_cmd="yum install -y sudo"
+    elif command -v dnf >/dev/null 2>&1; then
+      install_sudo_cmd="dnf install -y sudo"
     elif command -v apk >/dev/null 2>&1; then
       install_sudo_cmd="apk add sudo"
     else
@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.1.1"
+version="8.2.0"
 
 
 # 顏色定義
@@ -51,7 +51,7 @@ phpini_path()(
 check_system(){
   if command -v apt >/dev/null 2>&1; then
     system=1
-  elif command -v yum >/dev/null 2>&1; then
+  elif command -v dnf >/dev/null 2>&1; then
     system=2
     if grep -q -Ei "release 7|release 8" /etc/redhat-release; then
       echo -e "${RED}不支援 CentOS 7 或 CentOS 8，請升級至 9 系列 (Rocky/Alma/CentOS Stream)${RESET}"
@@ -80,9 +80,16 @@ check_and_start_service() {
 check_web_environment() {
   use_my_app=false
   port_in_use=false
-  ss -tln | grep -qE ':(80|443)\s' && port_in_use=true
-  # 有安裝 nginx 或 openresty 即可啟用
-  if command -v nginx >/dev/null 2>&1 || command -v openresty >/dev/null 2>&1 || command -v caddy >/dev/null 2>&1; then
+  
+  # 檢查端口佔用
+  if ss -tln | grep -qE ':(80|443)\s'; then
+    port_in_use=true
+  fi
+
+  # 判斷是否可用：有 Docker 容器 OR 本機有安裝 binary
+  if [ -n "$docker_name" ]; then
+    use_my_app=true
+  elif command -v nginx >/dev/null 2>&1 || command -v openresty >/dev/null 2>&1 || command -v caddy >/dev/null 2>&1; then
     use_my_app=true
   fi
 }
@@ -137,13 +144,12 @@ check_app(){
     ["wget"]="wget"
     ["jq"]="jq"
     ["nano"]="nano"
-    ["ss"]="iproute2"
     ["openssl"]="openssl"
   )
   if [ $system -eq 2 ]; then
     if ! [ -f /etc/fedora-release ]; then
-      if ! yum repolist enabled | grep -q "epel"; then
-        yum install -y epel-release
+      if ! dnf repolist enabled | grep -q "epel"; then
+        dnf install -y epel-release
       fi
     fi
   fi
@@ -152,7 +158,7 @@ check_app(){
       pkg="${pkg_map[$cmd]}"
       case "$system" in
       1) apt update -qq && apt install -y "$pkg" ;;
-      2) yum update && yum install -y "$pkg" ;;
+      2) dnf update && dnf install -y "$pkg" ;;
       esac
     fi
   done
@@ -172,11 +178,18 @@ check_app(){
       apt update && apt install -y dnsutils
       ;;
     2)
-      yum install -y bind-utils
+      dnf install -y bind-utils
       ;;
     3)
       apk add bind-tools
       ;;
+    esac
+  fi
+  if ! command -v ss &>/dev/null; then
+    case $system in
+    1)  apt update && apt install -y iproute2 ;;
+    2)  dnf install -y iproute ;;
+    3)  apk add iproute2 ;;
     esac
   fi
 }
@@ -202,33 +215,54 @@ check_webserver_install(){
           local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
           if [[ $os == kali ]]; then
             codename=bookworm
+            os=debain
           else
             codename=$(grep -Po 'VERSION="[0-9]+ \(\K[^)]+' /etc/os-release)
-            local codename_ver=$(grep -Po '(?<=VERSION_ID=")[0-9]+' /etc/os-release)
           fi
-          if [ $codename_ver -gt 12 ]; then
-            codename=bookworm
-          fi
-          if ! curl -sf "https://openresty.org/package/debian/dists/${codename}/" >/dev/null; then
-            echo -e "${RED}官方倉庫尚未支援 ${codename}${RESET}"
-            sleep 2
+          if ! curl -sf "https://openresty.org/package/$os/dists/${codename}/" >/dev/null; then
+            if command -v docker >/dev/null; then
+              install_web_server openresty docker
+              break
+            else
+              echo -e "${RED}官方倉庫尚未支援 ${codename}${RESET}"
+              sleep 2
+            fi
           else
             install_web_server openresty
             break
+          fi
+        elif [ $system -eq 2 ]; then
+          local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          local version=$(grep "^VERSION_ID=" /etc/os-release | cut -d'"' -f2)
+          if curl -sf https://openresty.org/package/$os/$version/main >/dev/null; then
+            install_web_server openresty
+            break
+          else
+            if command -v docker >/dev/null; then
+              install_web_server openresty docker
+              break
+            else
+              echo -e "${RED}官方倉庫尚未支援 ${codename}${RESET}"
+              sleep 2
+            fi
           fi
         elif [ $system == 3 ]; then
           if curl -sf https://openresty.org/package/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main >/dev/null; then
             install_web_server openresty
           else
-            install_web_server openresty compile
-            break
+            if command -v docker >/dev/null; then
+              install_web_server openresty docker
+              break
+            else
+              install_web_server openresty compile
+              break
+            fi
           fi
         fi
         ;;
       3)
         if [ $system -eq 3 ]; then
-          echo -e "
-          ${YELLOW}官方倉庫尚未支援${RESET}"
+          echo -e "${YELLOW}官方倉庫尚未支援${RESET}"
           sleep 1
         fi
         install_web_server caddy
@@ -238,30 +272,62 @@ check_webserver_install(){
   fi
 }
 
-check_web_server(){
+check_web_server() {
   openresty=0
   nginx=0
   caddy=0
-  if command -v openresty >/dev/null 2>&1; then
-    openresty=1
-  elif command -v nginx >/dev/null 2>&1; then
-    nginx=1
-  elif command -v caddy >/dev/null 2>&1; then
-    caddy=1
+  docker_name=""
+
+  # --- host binary 檢測 ---
+  command -v openresty >/dev/null 2>&1 && openresty=1
+  command -v nginx    >/dev/null 2>&1 && nginx=1
+  command -v caddy    >/dev/null 2>&1 && caddy=1
+
+  # --- docker container 檢測 ---
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    # 只抓「正在跑」的 container 名稱
+    containers="$(docker ps --format '{{.Names}}')"
+
+    if echo "$containers" | grep -qi 'openresty'; then
+      openresty=1
+      docker_name="openresty"
+    elif echo "$containers" | grep -qi 'nginx'; then
+      nginx=1
+      docker_name="nginx"
+    elif echo "$containers" | grep -qi 'caddy'; then
+      caddy=1
+      docker_name="caddy"
+    fi
   fi
 }
 
 detect_nginx_conf_paths(){
-  local command=""
-  if [ $openresty -eq 1 ]; then
-    command=openresty
-  elif [ $nginx -eq 1 ]; then
-    command=nginx
+  local cmd_bin=""
+  local conf_path=""
+
+  # --- Docker 模式 ---
+  if [ -n "$docker_name" ]; then
+    # 判斷容器內的 binary 名稱 (OpenResty 容器內通常也是叫 openresty 或 nginx)
+    if [ "$openresty" -eq 1 ]; then
+      cmd_bin="openresty"
+    elif [ "$nginx" -eq 1 ]; then
+      cmd_bin="nginx"
+    fi
+    
+    # 執行 docker exec 取回 config 路徑
+    # 注意：這裡拿到的是【容器內路徑】，如果你要編輯，需要確保你的腳本知道對應的 Host 路徑
+    conf_path="/etc/nginx/nginx.conf"
+
+  # --- Host 模式 ---
+  else
+    if [ "$openresty" -eq 1 ]; then
+      cmd_bin="openresty"
+    elif [ "$nginx" -eq 1 ]; then
+      cmd_bin="nginx"
+    fi
+    conf_path=$($cmd_bin -t 2>&1 | sed -n '2s/^nginx: configuration file \(.*\) test.*$/\1/p')
   fi
-  # 執行 nginx/openresty -t 並提取配置文件路徑
-  # 從第二行提取,移除 "nginx: configuration file " 和 " test" 之後的內容
-  local conf_path=$($command -t 2>&1 | sed -n '2s/^nginx: configuration file \(.*\) test.*$/\1/p')
-  
+
   echo "$conf_path"
 }
 # WordPress備份
@@ -415,23 +481,33 @@ clean_ssl_session_cache() {
 
 check_http3_support() {
   support_http3=false
-  # 找出 nginx 或 openresty 的執行檔
-  nginx_bin=""
-  if command -v openresty >/dev/null 2>&1; then
-    nginx_bin=$(command -v openresty)
-  elif command -v nginx >/dev/null 2>&1; then
-    nginx_bin=$(command -v nginx)
+  local check_cmd=""
+
+  # --- Docker 模式 ---
+  if [ -n "$docker_name" ]; then
+    if [ "$openresty" -eq 1 ]; then
+      check_cmd="docker exec $docker_name openresty"
+    elif [ "$nginx" -eq 1 ]; then
+      check_cmd="docker exec $docker_name nginx"
+    fi
+
+  # --- Host 模式 ---
+  else
+    if command -v openresty >/dev/null 2>&1; then
+      check_cmd=$(command -v openresty)
+    elif command -v nginx >/dev/null 2>&1; then
+      check_cmd=$(command -v nginx)
+    fi
   fi
 
-  # 沒有 nginx/openresty 就直接 return
-  [ -z "$nginx_bin" ] && return
+  # 如果找不到執行命令的方式，直接回傳
+  [ -z "$check_cmd" ] && echo "$support_http3" && return
 
-  # 嘗試從版本資訊中看是否支援 http_v3_module
-  if "$nginx_bin" -V 2>&1 | grep -q -- '--with-http_v3_module'; then
+  # 執行檢查 (由 host 或 docker exec 執行)
+  if $check_cmd -V 2>&1 | grep -q -- '--with-http_v3_module'; then
     support_http3=true
-    echo "$support_http3"
-    return
   fi
+  
   echo "$support_http3"
 }
 
@@ -502,7 +578,7 @@ check_flarum_supported_php() {
       versions=$(apt-cache search ^php[0-9.]+$ | grep -oP '^php\K[0-9.]+' | awk -F. '$1 >= 8 {print}' | sort -Vr)
       ;;
     2) # CentOS
-      versions=$(yum module list php | grep -E '^php\s+(remi-)?8\.[0-9]+' | awk '{print $2}' | sed 's/remi-//' | sort -Vu | xargs)
+      versions=$(dnf module list php | grep -E '^php\s+(remi-)?8\.[0-9]+' | awk '{print $2}' | sed 's/remi-//' | sort -Vu | xargs)
       ;;
     3) # Alpine
       versions=$(apk search -x php[0-9]* | grep -oE 'php[0-9]+' | sed 's/php//' | sort -u | awk '{printf "8.%d\n", $1 - 80}' | sort -Vr)
@@ -527,12 +603,8 @@ check_flarum_supported_php() {
 
 create_directories() {
   [ $caddy -eq 1 ] && return 0
-  mkdir -p /home/web/
   mkdir -p /home/web/cert
   mkdir -p /etc/nginx/conf.d/
-  mkdir -p /etc/nginx/logs
-  touch /etc/nginx/logs/error.log
-  touch /etc/nginx/logs/access.log
 }
 chown_set(){
   local ngx_user=$(get_web_run_user)
@@ -603,9 +675,9 @@ check_php_ext_available() {
       apt-cache show "php$phpver-$ext_name" &>/dev/null && return 0
       ;;
 
-    2)  # CentOS / RHEL / AlmaLinux / Rocky (YUM + Remi)
-      yum --quiet list available "php-$ext_name" &>/dev/null && return 0
-      yum --quiet list available "php-pecl-$ext_name" &>/dev/null && return 0
+    2)  # CentOS / RHEL / AlmaLinux / Rocky (dnf + Remi)
+      dnf --quiet list available "php-$ext_name" &>/dev/null && return 0
+      dnf --quiet list available "php-pecl-$ext_name" &>/dev/null && return 0
       ;;
 
     3)  # Alpine (APK)
@@ -904,12 +976,26 @@ default(){
   local ngx_conf=$(detect_nginx_conf_paths)
   create_directories
   generate_ssl_cert
+  if [[ "$docker_name" == "openresty" || "$docker_name" == "nginx" ]]; then
+    mkdir -p /etc/nginx/logs
+    touch /etc/nginx/logs/error.log
+    touch /etc/nginx/logs/access.log
+    case $system in
+    1|2)  id -u nginx &>/dev/null || (groupadd -g 1689 nginx && useradd -u 1689 -g 1689 -s /sbin/nologin -M nginx) ;;
+    3)  id -u nginx &>/dev/null || (addgroup -g 1689 nginx && adduser -u 1689 -G nginx -D -H -s /sbin/nologin nginx) ;;
+    esac
+    wget -qO $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
+    wget -qO $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+    sed -i 's|include /etc/nginx/conf.d/\*.conf;|include /usr/local/openresty/nginx/conf/conf.d/*.conf;|' "$ngx_conf"
+    return 0
+  fi
   case "$system" in
   1|2)
     if [ $mode == openresty ]; then
       rm -f $ngx_conf
       wget -O $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
       id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
+      wget -O $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     fi
     if [ $mode == caddy ]; then
       rm -f /etc/caddy/Caddyfile
@@ -917,7 +1003,7 @@ default(){
       mkdir -p /etc/caddy/conf.d
     else
       rm -f $detect_conf_path/default.conf $detect_conf_path/default
-      wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+      wget -O $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     fi
     restart_webserver
     ;;
@@ -929,22 +1015,39 @@ default(){
     rm -f $detect_conf_path/default.conf
     rm -f $ngx_conf
     wget -O $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
-    wget -O /etc/nginx/conf.d/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+    wget -O $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     restart_webserver
     ;;
   esac
 }
 
 detect_conf_path() {
+  if [ -n "$docker_name" ]; then
+  
+    local docker_host_vhost_path="/etc/nginx/conf.d"
+    
+    # 確保這個目錄在宿主機上存在，如果不存在就建立它
+    mkdir -p "$docker_host_vhost_path"
+    
+    # 直接回傳此固定路徑，並結束函數，不再執行後面的 Host 檢測邏輯
+    echo "$docker_host_vhost_path"
+    return 0
+  fi
+
+  # --- 以下為 Host 原生環境處理 (維持你原本的邏輯不變) ---
+  
   local conf=""
   local default_conf_dir=""
+  
   if command -v openresty >/dev/null 2>&1 || command -v nginx >/dev/null 2>&1; then
+    # 在 Host 模式下，呼叫 detect_nginx_conf_paths 來取得主設定檔路徑
     conf=$(detect_nginx_conf_paths)
   elif command -v caddy >/dev/null 2>&1; then
     conf="/etc/caddy/Caddyfile"
   fi
+
+  # Caddy 的處理邏輯 (不變)
   if command -v caddy >/dev/null 2>&1; then
-    # 找出有 import 且含 * 的行
     local import_line
     import_line=$(grep -E '^[[:space:]]*import[[:space:]]+/' "$conf" | grep '\*' | head -n 1)
 
@@ -959,18 +1062,16 @@ detect_conf_path() {
 
     default_conf_dir="/etc/caddy/conf.d"
     mkdir -p "$default_conf_dir"
-
-    # 插入 import 行到 Caddyfile 最後一行
     echo "" >> "$conf"
     echo "import ${default_conf_dir}/*" >> "$conf"
-
-    # 重啟 Caddy
     restart_webserver
     echo "$default_conf_dir"
     return 0
   fi
-  # 搜尋 include *.conf
+
+  # Nginx / OpenResty 在 Host 上的處理邏輯 (不變)
   local search_regex='^[[:space:]]*include[[:space:]]+([^;]*\*[^;]*);'
+  # 從主設定檔中尋找 include xxx/*.conf; 這樣的行
   local included_path=$(sed -E -n "s/${search_regex}/\1/p" "$conf" | head -n 1)
 
   if [[ -n "$included_path" ]]; then
@@ -981,15 +1082,18 @@ detect_conf_path() {
     return 0
   fi
 
+  # 如果在主設定檔中找不到 include，則使用預設路徑
   if command -v openresty >/dev/null 2>&1; then
+    # OpenResty 的預設路徑
     default_conf_dir="/usr/local/openresty/nginx/conf/conf.d"
   else
+    # Nginx 的預設路徑
     default_conf_dir="/etc/nginx/conf.d"
   fi
 
   mkdir -p "$default_conf_dir"
 
-  # 若 nginx.conf 中沒有 include conf.d → 自動插入
+  # 檢查主設定檔是否已經包含了這個預設目錄，如果沒有就自動加上
   if ! grep -qE "include[[:space:]]+${default_conf_dir}/\*\.conf;" "$conf"; then
     sed -i "/^http[[:space:]]*{/,/^}/ {
       /^}/i\\    include ${default_conf_dir}/*.conf;
@@ -1274,8 +1378,7 @@ flarum_setup() {
       return 1
     fi
   }
-
-  local db_name="flarum_${domain//./_}"
+  local db_name="flarum_$(echo $domain | sed 's/\./_/g; s/-//g')"
   local db_user="${db_name}_user"
   local db_pass=$(dba mysql add $db_name $db_user false)
 
@@ -1382,7 +1485,7 @@ generate_ssl_cert(){
   -keyout /home/web/cert/default_server.key \
   -out /home/web/cert/default_server.crt \
   -days 5475 \
-  -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name"
+  -subj "/C=US/ST=State/L=City/O=Organization/OU=Organizational Unit/CN=Common Name" >/dev/null
 }
 
 get_web_run_user() {
@@ -1445,101 +1548,99 @@ html_sites(){
   setup_site "$domain" html
   echo "已建立 $domain 之html站點。"
 }
-httpguard_setup()(
-  [ $caddy -eq 1 ] && return 0
+httpguard_setup() {
+  [ "$caddy" -eq 1 ] && return 0
   check_php
-  case $system in
-  1|2)
-    if ! command -v openresty &>/dev/null; then
-      echo -e "${RED}未偵測到 openresty 指令${RESET}"
-      read -p "操作完成，請按任意鍵繼續..." -n1
-      return 1
-    fi
-    local guard_dir="/usr/local/openresty/nginx/conf/HttpGuard"
-    ;;
-  3)
-    if ! command -v nginx &>/dev/null; then
-      echo -e "${RED}未偵測到 nginx 指令${RESET}"
-      read -p "操作完成，請按任意鍵繼續..." -n1
-      return 1
-    fi
-    if ! nginx -V 2>&1 | grep -iq lua; then
-      echo -e "${RED}您的 Nginx 不支援 Lua 模組，無法使用 HttpGuard。${RESET}"
-      read -p "操作完成，請按任意鍵繼續..." -n1
-      return 1
-    fi
-    local guard_dir="/etc/nginx/HttpGuard"
-    ;;
-  esac
+  
+  local guard_dir_host="/etc/nginx/HttpGuard" # 統一宿主機路徑
+  local guard_dir_container=""
   local ngx_conf=$(detect_nginx_conf_paths)
-  if [ -d "$guard_dir" ]; then
-    echo "HttpGuard 已安裝，進入管理選單..."
-    menu_httpguard
-    return 0
-  fi
-  local marker="HttpGuard/init.lua"
-
-  # === 若尚未安裝則執行安裝 ===
-  echo "下載 HttpGuard..."
   
-  case $system in
-  1|2)
-    local HttpGuard_download_path="/usr/local/openresty/nginx/conf/HttpGuard.zip"
-    local http_path="/usr/local/openresty/nginx/conf/HttpGuard"
-    ;;
-  3)
-    local HttpGuard_download_path="/etc/nginx/HttpGuard.zip"
-    local http_path="/etc/nginx/HttpGuard"
-    ;;
-  esac
-  wget -O $HttpGuard_download_path https://files.gebu8f.com/site/HttpGuard.zip || {
-    echo "下載失敗"
-    return 1
-  }
-
-  unzip -o "$HttpGuard_download_path" -d /etc/nginx
-  if [ $system = 3 ]; then
-    sed -i "s|^baseDir *=.*|baseDir = '/etc/nginx/HttpGuard/'|" /etc/nginx/HttpGuard/config.lua
-    local ss_path=$(command -v ss 2>/dev/null)
-    if [ -n "$ss_path" ]; then
-      sed -i "s|ssCommand *= *\"[^\"]*\"|ssCommand = \"$ss_path\"|" /etc/nginx/HttpGuard/config.lua
-    fi
+  # --- 1. 環境檢測與路徑設定 ---
+  if [ -n "$docker_name" ]; then
+    guard_dir_container="/usr/local/openresty/nginx/conf/HttpGuard"
+  else
+    case $system in
+      1|2)
+        [ ! -x "$(command -v openresty)" ] && { echo "未偵測到 openresty"; return 1; }
+        guard_dir_host="/usr/local/openresty/nginx/conf/HttpGuard"
+        guard_dir_container="/usr/local/openresty/nginx/conf/HttpGuard"
+        ;;
+      3)
+        [ ! -x "$(command -v nginx)" ] && { echo "未偵測到 nginx"; return 1; }
+        guard_dir_container="/etc/nginx/HttpGuard"
+        ;;
+    esac
   fi
-  rm $HttpGuard_download_path
-  echo "正在生成動態配置文件..."
-  cd $http_path/captcha/
-  php getImg.php
+
+  if [ -f "$guard_dir_host/config.lua" ]; then
+    menu_httpguard; return 0
+  fi
+
+  local tmp_zip="/tmp/HttpGuard.zip"
+  local tmp_dir="/tmp/httpguard_unpack"
+  mkdir -p "$tmp_dir"
+  wget -qO "$tmp_zip" https://files.gebu8f.com/site/HttpGuard.zip || return 1
+  unzip -qo "$tmp_zip" -d "$tmp_dir"
+
+  # 判斷裡面有沒有多一層 HttpGuard 目錄，有的話就平鋪移動
+  rm -rf "$guard_dir_host"
+  if [ -d "$tmp_dir/HttpGuard" ]; then
+    mv "$tmp_dir/HttpGuard" "$guard_dir_host"
+  else
+    mkdir -p "$guard_dir_host"
+    mv "$tmp_dir"/* "$guard_dir_host/"
+  fi
+  rm -rf "$tmp_dir" "$tmp_zip"
+
+  # --- 3. 配置修正與驗證碼生成 ---
+  sed -i "s|^baseDir *=.*|baseDir = '${guard_dir_container}/'|" "$guard_dir_host/config.lua"
+  local ss_cmd=""
+  if [ -n "$docker_name" ]; then
+    ss_cmd=$(docker exec "$docker_name" which ss 2>/dev/null | tr -d '\r')
+    [ -z "$ss_cmd" ] && ss_cmd="/usr/sbin/ss"
+  else
+    ss_cmd=$(command -v ss 2>/dev/null || echo "/usr/sbin/ss")
+  fi
+  sed -i "s|ssCommand *= *\"[^\"]*\"|ssCommand = \"$ss_cmd\"|" "$guard_dir_host/config.lua"
+
+  echo "正在生成驗證碼圖檔..."
+  (cd "$guard_dir_host/captcha" && php getImg.php)
+  chown -R nginx:nginx "$guard_dir_host"
+
+  # --- 4. 緊湊插入配置到 nginx.conf (關鍵修正) ---
+  echo "正在注入配置到 $ngx_conf..."
   
-  chown -R nginx:nginx $http_path
-  if [[ $system == 1 || $system == 2 ]]; then
-    sed -i '/http {/a \
-      lua_package_path "/usr/local/openresty/lualib/?.lua;/usr/local/openresty/nginx/conf/HttpGuard/?.lua;;";\n\
-      lua_package_cpath "/usr/local/openresty/lualib/?.so;;";\n\
-      lua_shared_dict guard_dict 100m;\n\
-      lua_shared_dict dict_captcha 128m;\n\
-      init_by_lua_file /usr/local/openresty/nginx/conf/HttpGuard/init.lua;\n\
-      access_by_lua_file /usr/local/openresty/nginx/conf/HttpGuard/runtime.lua;\n\
-      lua_max_running_timers 1;' "$ngx_conf"
-    else
-      sed -i '/http {/a \
-        lua_package_path "/usr/local/share/lua/5.1/?.lua;/etc/nginx/HttpGuard/?.lua;;";\n\
-        lua_package_cpath "/usr/local/lib/lua/5.1/?.so;;";\n\
-        lua_shared_dict guard_dict 100m;\n\
-        lua_shared_dict dict_captcha 128m;\n\
-        init_by_lua_file /etc/nginx/HttpGuard/init.lua;\n\
-        access_by_lua_file /etc/nginx/HttpGuard/runtime.lua;\n\
-        lua_max_running_timers 1;' "$ngx_conf"
-    fi
-      
-  if nginx -t; then
-    restart_webserver
+  # 根據環境準備 Lua 路徑
+  local lualib_path="/usr/local/openresty/lualib"
+  [ -z "$docker_name" ] && [ "$system" -eq 3 ] && lualib_path="/usr/local/share/lua/5.1"
+  local luaso_path="/usr/local/openresty/lualib"
+  [ -z "$docker_name" ] && [ "$system" -eq 3 ] && luaso_path="/usr/local/lib/lua/5.1"
+
+  # 建立一個暫存檔來存放要插入的內容，確保沒有空行
+  local tmp_block="/tmp/lua_block.tmp"
+  cat > "$tmp_block" <<EOF
+    lua_package_path "$lualib_path/?.lua;${guard_dir_container}/?.lua;;";
+    lua_package_cpath "$luaso_path/?.so;;";
+    lua_shared_dict guard_dict 100m;
+    lua_shared_dict dict_captcha 8m;
+    init_by_lua_file ${guard_dir_container}/init.lua;
+    access_by_lua_file ${guard_dir_container}/runtime.lua;
+    lua_max_running_timers 1;
+EOF
+
+  sed -i "/http {/r $tmp_block" "$ngx_conf"
+  rm -f "$tmp_block"
+
+  # --- 5. 重啟與測試 ---
+  if restart_webserver; then
     echo "HttpGuard 安裝完成"
     menu_httpguard
   else
-    echo "安裝失敗.."
+    echo "配置測試失敗，請手動檢查 $ngx_conf"
     return 1
   fi
-)
+}
 
 install_wp_plugin_with_search_or_url() {
   local domain="$1"
@@ -1632,19 +1733,38 @@ install_wp_plugin_with_search_or_url() {
 install_web_server(){
   local mode=$1
   local other=$2
-  local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
-  local codename=$(lsb_release -sc)
-  
+  local os=$(grep -w "^ID" /etc/os-release | cut -d= -f2 | tr -d '"')
+  local codename=$(grep -w "^VERSION_CODENAME" /etc/os-release | cut -d= -f2 | tr -d '"')
   if [ $mode == openresty ]; then
+    if [ $other == docker ]; then
+      check_web_server
+      openresty=1
+      docker_name=openresty
+      default $mode
+      mkdir -p /etc/nginx/conf.d
+      docker run -d \
+        --name openresty \
+        --restart always \
+        --network host \
+        -v /etc/letsencrypt:/etc/letsencrypt:ro \
+        -v /etc/nginx/conf.d:/usr/local/openresty/nginx/conf/conf.d:ro \
+        -v /etc/nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro \
+        -v /var/www:/var/www \
+        -v /run/php:/run/php:ro \
+        -v /home/web/cert:/home/web/cert:ro \
+        -v /etc/nginx/HttpGuard:/usr/local/openresty/nginx/conf/HttpGuard \
+        -v /etc/nginx/logs/access.log:/usr/local/openresty/nginx/logs/access.log \
+        -v /etc/nginx/logs/error.log:/usr/local/openresty/nginx/logs/error.log \
+        gebu8f/openresty:latest
+      check_web_server
+      return 0
+    fi
     case "$system" in
     1)
       apt update
       apt install -y curl gnupg2 ca-certificates lsb-release
-      curl -s https://openresty.org/package/pubkey.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/openresty.gpg
+      curl -s https://openresty.org/package/pubkey2.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/openresty.gpg
       if [[ $os == "debian" ]]; then
-        if [[ $codename == "trixie" ]]; then
-          codename="bookworm"
-        fi
         echo "deb https://openresty.org/package/debian $codename openresty" | tee /etc/apt/sources.list.d/openresty.list
       elif [[ $os == "kali" ]]; then
         codename="bookworm"
@@ -1661,11 +1781,11 @@ install_web_server(){
       systemctl enable openresty
     ;;
     2)
-      yum update
-      yum install -y yum-utils
-      yum-config-manager --add-repo https://openresty.org/package/centos/openresty.repo
-      yum update
-      yum install -y openresty --nogpgcheck
+      dnf update
+      dnf install -y dnf-utils
+      dnf-config-manager --add-repo https://openresty.org/package/$os/openresty.repo
+      dnf update
+      dnf install -y openresty --nogpgcheck
       rm -rf /etc/nginx
       ln -sf /usr/local/openresty/nginx/sbin/nginx /usr/sbin/nginx
       ln -sf /usr/local/openresty/nginx/conf /etc/nginx
@@ -1773,7 +1893,7 @@ EOF
       systemctl enable nginx
       ;;
     2)
-      tee /etc/yum.repos.d/nginx.repo << 'EOF'
+      tee /etc/dnf.repos.d/nginx.repo << 'EOF'
 [nginx-stable]
 name=nginx stable repo
 baseurl=https://nginx.org/packages/centos/$releasever/$basearch/
@@ -1782,7 +1902,7 @@ enabled=1
 gpgkey=https://nginx.org/keys/nginx_signing.key
 module_hotfixes=true
 EOF
-      yum install nginx -y
+      dnf install nginx -y
       systemctl enable nginx
       ;;
     3)
@@ -1840,6 +1960,7 @@ php_install() {
   case $system in
     1)
       local os=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+      local DEB_VER=$(cat /etc/debian_version | cut -d. -f1)
       local codename=$(lsb_release -sc)
       apt update
       apt install -y software-properties-common ca-certificates lsb-release gnupg curl
@@ -1874,23 +1995,30 @@ php_install() {
         echo -e "${RED}無效版本號：$phpver${RESET}"
         return 1
       fi
+      if [ "$DEB_VER" -ge 13 ]; then
+        apt install valkey-server -y
+      else
+        apt install -y redis-server
+      fi
 
       apt install -y php$phpver php$phpver-fpm php$phpver-mysql php$phpver-curl php$phpver-gd \
-        php$phpver-xml php$phpver-mbstring php$phpver-zip php$phpver-intl php$phpver-bcmath php$phpver-imagick unzip redis
+        php$phpver-xml php$phpver-mbstring php$phpver-zip php$phpver-intl php$phpver-bcmath php$phpver-imagick unzip
 
       systemctl enable --now php$phpver-fpm
       ;;
 
     2)
-      yum update -y
-      yum install -y epel-release
-      yum install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm
-      yum update -y
-      yum module reset php -y
+      dnf update -y
+      dnf install -y epel-release dnf-plugins-core
+      local REHL_VER=$(grep -oP 'release \K[0-9]+' /etc/redhat-release)
+      dnf install -y https://rpms.remirepo.net/enterprise/remi-release-$REHL_VER.rpm
+      dnf update -y
+      dnf config-manager --set-enabled remi-modular
+      dnf makecache -y 
       
       local flarum_php_var=$(check_flarum_supported_php)
 
-      local php_versions=$(yum module list php | grep -E '^php\s+(remi-)?8\.[0-9]+' | awk '{print $2}' | sed 's/remi-//' | sort -Vu | xargs)
+      local php_versions=$(dnf module list php | grep -E '^php\s+(remi-)?8\.[0-9]+' | awk '{print $2}' | sed 's/remi-//' | sort -Vu | xargs)
 
       if [[ -z "$php_versions" ]]; then
         echo -e "${RED}無法偵測可用 PHP 模組版本。${RESET}"
@@ -1907,14 +2035,20 @@ php_install() {
         return 1
       fi
 
-      yum module reset php -y
-      yum module enable php:remi-$phpver -y
-      yum install -y php php-fpm php-mysqlnd php-curl php-gd php-xml php-mbstring php-zip php-intl php-bcmath php-pecl-imagick unzip redis
+      dnf module reset php -y
+      dnf module enable php:remi-$phpver -y
+      dnf install -y php php-fpm php-mysqlnd php-curl php-gd php-xml php-mbstring php-zip php-intl php-bcmath php-pecl-imagick unzip valkey
 
       systemctl enable --now php-fpm
+      systemctl enable --now valkey
+      echo -e "${GREEN}PHP $phpver 與 Valkey 安裝完成！${RESET}"
+      sleep 1.5
       ;;
 
     3)
+      local ALPINE_VER_FULL=$(cat /etc/alpine-release)
+      local MAJOR=$(echo "$ALPINE_VER_FULL" | cut -d. -f1)
+      local MINOR=$(echo "$ALPINE_VER_FULL" | cut -d. -f2)
       echo "@edgecommunity http://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
       apk update
       
@@ -1958,10 +2092,19 @@ php_install() {
         echo -e "${RED}您好，您的php版本$phpver無法安裝${RESET}"
         return 1
       fi
+      if [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge 20 ]; }; then
+        apk add --no-cache valkey
+        rc-update add valkey default
+        rc-service valkey start
+      else
+        apk add --no-cache redis
+        rc-update add redis default
+        rc-service redis start
+      fi
 
       apk add php$shortver php$shortver-fpm php$shortver-mysqli php$shortver-curl \
         php$shortver-gd php$shortver-xml php$shortver-mbstring php$shortver-zip \
-        php$shortver-intl php$shortver-bcmath php$shortver-pecl-imagick php$shortver-phar unzip redis || {
+        php$shortver-intl php$shortver-bcmath php$shortver-pecl-imagick php$shortver-phar unzip || {
           echo -e "${RED}安裝失敗，請確認版本是否存在於 Edge 社群源。${RESET}"
           return 1
         }
@@ -1990,12 +2133,19 @@ php_fix(){
     systemctl restart php$php_var-fpm
 
   elif [ $system -eq 2 ]; then  # CentOS/RHEL
-    sed -i "s|^user *=.*|user = $ngx_user|" /etc/php-fpm.d/www.conf
-    sed -i "s|^group *=.*|group = $ngx_user|" /etc/php-fpm.d/www.conf
-    sed -i "s|^listen.owner *=.*|listen.owner = $ngx_user|" /etc/php-fpm.d/www.conf
-    sed -i "s|^listen.group *=.*|listen.group = $ngx_user|" /etc/php-fpm.d/www.conf
-    sed -i "s|^listen =.*|listen = /run/php/php-fpm.sock|" /etc/php-fpm.d/www.conf
-    sed -i "s|^listen.mode *=.*|listen.mode = 0660|" /etc/php-fpm.d/www.conf
+    semanage fcontext -a -t httpd_var_run_t "/run/php(/.*)?"
+    restorecon -Rv /run/php
+    echo "d /run/php 0755 nginx nginx - -" | sudo tee /etc/tmpfiles.d/php-fpm-custom.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/php-fpm-custom.conf
+    local web_users="nginx,apache"
+    if id "caddy" &>/dev/null; then
+      web_users="$web_users,caddy"
+    fi
+    sed -i "s|^[;[:space:]]*user *=.*|user = $ngx_user|" /etc/php-fpm.d/www.conf
+    sed -i "s|^[;[:space:]]*group *=.*|group = $ngx_user|" /etc/php-fpm.d/www.conf
+    sed -i "s|^[;[:space:]]*listen.acl_users *=.*|listen.acl_users = $web_users|" /etc/php-fpm.d/www.conf
+    sed -i "s|^[;[:space:]]*listen.mode *=.*|listen.mode = 0660|" /etc/php-fpm.d/www.conf
+    sed -i "s|^[;[:space:]]*listen *=.*|listen = /run/php/php-fpm.sock|" /etc/php-fpm.d/www.conf
     chown_set
     systemctl restart php-fpm
 
@@ -2020,7 +2170,7 @@ php_switch_version() {
     ;;
   2)
     oldver=$(check_php_version)
-    local versions=$(yum module list php | grep -E '^php\s+(remi-)?8\.[0-9]+' | awk '{print $2}' | sed 's/remi-//' | sort -Vu | xargs)
+    local versions=$(dnf module list php | grep -E '^php\s+(remi-)?8\.[0-9]+' | awk '{print $2}' | sed 's/remi-//' | sort -Vu | xargs)
     ;;
   3)
     local oldver=$(php -v | head -n1 | grep -oE '[0-9]+\.[0-9]+') # 8.3
@@ -2106,14 +2256,14 @@ php_switch_version() {
     1)
       apt purge -y php$oldver* ;;
     2)
-      yum module reset php -y
+      dnf module reset php -y
       mapfile -t php_packages < <(rpm -qa | grep "^php-" | awk '{print $1}')
       if [[ ${#php_packages[@]} -eq 0 ]]; then
         echo -e "${YELLOW}未發現任何 PHP 套件可移除。${RESET}"
       else
         echo -e "${CYAN}即將移除下列 PHP 套件：${RESET}"
         printf ' - %s\n' "${php_packages[@]}"
-        yum remove -y --noautoremove "${php_packages[@]}"
+        dnf remove -y --noautoremove "${php_packages[@]}"
       fi
       ;;
     3)
@@ -2126,8 +2276,8 @@ php_switch_version() {
       apt install php$newver php$newver-fpm -y
       ;;
     2)
-      yum module enable php:remi-$newver -y 
-      yum install php php-fpm -y
+      dnf module enable php:remi-$newver -y 
+      dnf install php php-fpm -y
       ;;
     3)
       apk add php$shortnew php$shortnew-fpm
@@ -2139,7 +2289,7 @@ php_switch_version() {
     echo " - 重新安裝模組：$ext"
     case $system in
       1) apt install -y php$newver-$ext ;;
-      2) yum install -y php-$ext ;;
+      2) dnf install -y php-$ext ;;
       3) apk add php$shortnew-$ext ;;
     esac
   done
@@ -2248,7 +2398,7 @@ php_install_extensions() {
       systemctl restart php$php_var-fpm
       ;;
     2)
-      yum install -y php-$ext_name || yum install -y php-pecl-$ext_name
+      dnf install -y php-$ext_name || dnf install -y php-pecl-$ext_name
       systemctl restart php-fpm
       ;;
     3)
@@ -2302,12 +2452,60 @@ reverse_proxy(){
 }
 
 restart_webserver() {
-  if [ "$openresty" -eq "1" ]; then
-    service openresty restart
-  elif [ "$nginx" -eq "1" ]; then
-    service nginx restart
-  elif [ "$caddy" -eq "1" ]; then 
-    service caddy restart
+  local test_cmd=""
+  local restart_cmd=""
+  local web_server_name=""
+  local test_output=""
+  local exit_code=0
+
+  # --- Docker 環境處理 ---
+  if [ -n "$docker_name" ]; then
+    
+    # 根據容器類型，決定測試指令
+    if [ "$openresty" -eq 1 ]; then
+      web_server_name="OpenResty"
+      test_cmd="docker exec $docker_name openresty -t"
+    elif [ "$nginx" -eq 1 ]; then
+      web_server_name="Nginx"
+      test_cmd="docker exec $docker_name nginx -t"
+    fi
+    
+    # 決定重啟指令
+    restart_cmd="docker restart $docker_name"
+    
+  # --- Host 原生環境處理 ---
+  else
+    
+    # 根據服務類型，決定測試和重啟指令
+    if [ "$openresty" -eq 1 ]; then
+      web_server_name="OpenResty"
+      test_cmd="openresty -t"
+      restart_cmd="service openresty restart"
+    elif [ "$nginx" -eq 1 ]; then
+      web_server_name="Nginx"
+      test_cmd="nginx -t"
+      restart_cmd="service nginx restart"
+    elif [ "$caddy" -eq 1 ]; then
+      web_server_name="Caddy"
+      test_cmd="caddy validate --config /etc/caddy/Caddyfile"
+      restart_cmd="service caddy restart"
+    fi
+  fi
+  # --- 執行測試 ---
+  # 執行測試指令，並將 stdout 和 stderr 都存到 test_output 變數中
+  test_output=$($test_cmd 2>&1)
+  exit_code=$?
+
+  # --- 根據測試結果決定是否重啟 ---
+  if [ $exit_code -eq 0 ]; then
+    $restart_cmd >/dev/null 2>&1
+    return 0
+  else
+    echo -e "${RED}錯誤：${web_server_name} 設定檔測試失敗！服務未重啟。${RESET}"
+    echo -e "${RED}詳細錯誤訊息如下：${RESET}"
+    echo -e "$test_output"
+    echo -e "${RED}--------------------------------------------------${RESET}"
+    return 1
   fi
 }
 
@@ -2656,33 +2854,53 @@ set_site_permissions() {
 
 setup_site_http2(){
   local domain=$1
-  local http3=$(check_http3_support)
-
-  local conf_file=$(detect_conf_path)/$domain.conf
-
+  local http3=$(check_http3_support) # 這裡會呼叫上面修好的函數
+  
+  local conf_file=$(detect_conf_path)/$domain.conf 
+  
   if [[ "$http3" != "true" ]]; then
-    if command -v nginx >/dev/null 2>&1; then
-      local ngx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-    elif command -v openresty >/dev/null 2>&1; then
-      local ngx_ver=$(openresty -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    local ngx_ver=""
+    
+    # --- 獲取版本號 (Docker 兼容) ---
+    if [ -n "$docker_name" ]; then
+      if [ "$openresty" -eq 1 ]; then
+        ngx_ver=$(docker exec "$docker_name" openresty -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+      elif [ "$nginx" -eq 1 ]; then
+        ngx_ver=$(docker exec "$docker_name" nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+      fi
+    else
+      # Host 模式
+      if command -v nginx >/dev/null 2>&1; then
+        ngx_ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+      elif command -v openresty >/dev/null 2>&1; then
+        ngx_ver=$(openresty -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+      fi
     fi
     if [ "$(printf '%s\n' "$ngx_ver" "1.25.1" | sort -V | head -n1)" != "1.25.1" ]; then
-      sed -i -e '/http2 on/d' "$conf_file"
-      # 把 listen 443 ssl; 變成 listen 443 ssl http2;
-      sed -i -E 's/(listen\s+443\s+ssl)(;)/\1 http2\2/' "$conf_file"
-      sed -i -E 's/(listen\s+\[::\]:443\s+ssl)(;)/\1 http2\2/' "$conf_file"
+      # 如果檔案存在才修改
+      if [ -f "$conf_file" ]; then
+        sed -i -e '/http2 on/d' "$conf_file"
+        # 把 listen 443 ssl; 變成 listen 443 ssl http2;
+        sed -i -E 's/(listen\s+443\s+ssl)(;)/\1 http2\2/' "$conf_file"
+        sed -i -E 's/(listen\s+\[::\]:443\s+ssl)(;)/\1 http2\2/' "$conf_file"
+      else
+        echo "警告: 找不到配置文件 $conf_file，跳過 HTTP/2 修改"
+      fi
     fi
-    # 刪除所有 HTTP/3 + QUIC 相關設定
-    sed -i \
-      -e '/listen.*quic/d' \
-      -e '/http3 on/d' \
-      -e '/http2 on/d' \
-      -e '/Alt-Svc/d' \
-      -e '/QUIC-Status/d' \
-      "$conf_file"
 
-
-    echo -e "${GREEN}已刪除 $conf_file 中所有 HTTP/3 / QUIC 相關配置，並啟用 HTTP/2${RESET}"
+    # 刪除 HTTP/3 相關配置
+    if [ -f "$conf_file" ]; then
+      sed -i \
+        -e '/listen.*quic/d' \
+        -e '/http3 on/d' \
+        -e '/http2 on/d' \
+        -e '/Alt-Svc/d' \
+        -e '/QUIC-Status/d' \
+        "$conf_file"
+      
+      # 這裡需要引入你的顏色變量 GREEN 和 RESET，或者直接 echo
+      echo "已刪除 $conf_file 中所有 HTTP/3 / QUIC 相關配置，並啟用 HTTP/2"
+    fi
   fi
 }
 
@@ -2731,17 +2949,6 @@ setup_site() {
             -e "s|main|$escaped_cert|g" \
             "$conf_file"
           setup_site_http2 "$domain"
-          if [ $openresty -eq 1 ]; then
-            openresty -t || {
-              echo "openresty 測試失敗，請檢查配置"
-              return 1
-            }
-          elif [ $nginx -eq 1 ]; then
-            nginx -t || {
-              echo "nginx 測試失敗，請檢查配置"
-              return 1
-            }
-          fi
           restart_webserver
           ;;
         proxy)
@@ -2754,17 +2961,6 @@ setup_site() {
             -e "s|main|$escaped_cert|g" \
             "$conf_file"
           setup_site_http2 "$domain"
-          if [ $openresty -eq 1 ]; then
-            openresty -t || {
-              echo "openresty 測試失敗，請檢查配置"
-              return 1
-            }
-          elif [ $nginx -eq 1 ]; then
-            nginx -t || {
-              echo "nginx 測試失敗，請檢查配置"
-              return 1
-            }
-          fi
           restart_webserver
           ;;
         *)
@@ -3238,19 +3434,11 @@ toggle_httpguard_module() {
   local module_name=$1
   local current_state=$2
   local config_file
-
-  case $system in
-    1|2)
-      config_file="/usr/local/openresty/nginx/conf/HttpGuard/config.lua"
-      ;;
-    3)
-      config_file="/etc/nginx/HttpGuard/config.lua"
-      ;;
-  esac
-
-  if [ ! -f "$config_file" ]; then
-    echo "錯誤：HttpGuard/config.lua 未找到。請確認安裝目錄或文件路徑。"
-    return 1
+  
+  if [ -f /usr/local/openresty/nginx/conf/HttpGuard/config.lua ]; then
+    config_file="/usr/local/openresty/nginx/conf/HttpGuard/config.lua"
+  elif [ -f /etc/nginx/HttpGuard/config.lua ]; then
+    config_file="/etc/nginx/HttpGuard/config.lua"
   fi
 
   local new_state=""
@@ -3262,20 +3450,12 @@ toggle_httpguard_module() {
     echo "錯誤：無法識別的當前狀態 '$current_state'。"
     return 1
   fi
-
-  echo "正在將模組 [$module_name] 的狀態從 [$current_state] 切換為 [$new_state]..."
-
-  # 使用 sed 替換 config.lua 中的狀態
-  # 這裡使用一個更精確的 regex，確保只替換指定模組的 state 值
   sed -i "/^\s*${module_name}\s*=/ s/state\s*=\s*\"[^\"]*\"/state = \"$new_state\"/" "$config_file"
 
   if [ $? -eq 0 ]; then
     echo -e "${GREEN}模組 [$module_name] 狀態已更新為 [$new_state]。${RESET}"
-    echo "正在重啟 Nginx/OpenResty 以應用變更..."
     restart_webserver
-    if [ $? -eq 0 ]; then
-      echo -e "${GREEN}Nginx/OpenResty 已重啟成功。${RESET}"
-    else
+    if ! [ $? -eq 0 ]; then
       echo -e "${RED}Nginx/OpenResty 重啟失敗，請手動檢查配置。${RESET}"
     fi
   else
@@ -3334,64 +3514,74 @@ update_script() {
 }
 
 uninstall_webserver(){
-  check_web_server
-  if [ $openresty -eq 1 ]; then
+  check_web_server # 獲取當前環境狀態與 docker_name
+  
+  if [ -n "$docker_name" ]; then
+    docker stop "$docker_name" >/dev/null 2>&1
+    docker rm -f "$docker_name" >/dev/null 2>&1
+  fi
+
+  if [ "$openresty" -eq 1 ]; then
     case $system in
-    1|2)
-      systemctl disable openresty
-      ;;
-    3)
-      rc-update del openresty default
-      ;;
+    1|2) systemctl disable openresty >/dev/null 2>&1 ;;
+    3) rc-update del openresty default >/dev/null 2>&1 ;;
     esac
-    service openresty stop
+    service openresty stop >/dev/null 2>&1
+    
     case $system in
     1) apt purge -y openresty ;;
-    2) yum remove -y openresty ;;
+    2) dnf remove -y openresty ;;
     3) apk del openresty ;;
     esac
-    pkill -f openresty
-    pkill -f nginx
-    unlink /etc/nginx
-    unlink /usr/sbin/nginx
-    rm -rf /etc/nginx
-  elif [ $nginx -eq 1 ]; then
+    pkill -f openresty >/dev/null 2>&1
+    pkill -f nginx >/dev/null 2>&1
+    
+    # 清理符號連結與目錄
+    unlink /etc/nginx >/dev/null 2>&1
+    unlink /usr/sbin/nginx >/dev/null 2>&1
+    rm -rf /usr/local/openresty
+
+  elif [ "$nginx" -eq 1 ]; then
     case $system in
-    1|2)
-      systemctl disable nginx
-      ;;
-    3)
-      rc-update del nginx default
-      ;;
+    1|2) systemctl disable nginx >/dev/null 2>&1 ;;
+    3) rc-update del nginx default >/dev/null 2>&1 ;;
     esac
-    service nginx stop
+    service nginx stop >/dev/null 2>&1
+    
     case $system in
     1) apt purge -y nginx* ;;
-    2) yum remove -y nginx ;;
-    3)
+    2) dnf remove -y nginx ;;
+    3) 
       apk del nginx
       rm -rf /etc/init.d/nginx
     ;;
     esac
-    rm -rf /etc/nginx
+    
     local nginx_path=$(command -v nginx)
-    if [ -n $nginx_path ]; then
-      rm -rf $nginx_path
-    fi
-    pkill -f nginx
-  elif [ $caddy -eq 1 ]; then
+    [ -n "$nginx_path" ] && rm -rf "$nginx_path"
+    pkill -f nginx >/dev/null 2>&1
+
+  elif [ "$caddy" -eq 1 ]; then
     case $system in
-    1)  apt purge -y caddy ;;
-    2)  yum remove -y caddy ;;
+    1) apt purge -y caddy ;;
+    2) dnf remove -y caddy ;;
     esac
     rm -rf /etc/caddy
   fi
+  if [[ $openresty -eq 1 || $nginx -eq 1 ]]; then
+    rm -rf /etc/nginx
+    rm -rf /home/web
+  fi
+  
+  echo -e "${GREEN}解除安裝完成！所有配置與服務已清除。${RESET}"
+  
   exit 0
 }
 
 
 
 wordpress_site() {
+  trap 'rm -f /tmp/wordpress.zip; rm -rf /tmp/wordpress' EXIT
   local MY_IP=$(curl -s https://api64.ipify.org)
   local ngx_user=$(get_web_run_user)
 
@@ -3437,8 +3627,7 @@ wordpress_site() {
   curl -L https://wordpress.org/latest.zip -o /tmp/wordpress.zip
   unzip /tmp/wordpress.zip -d /tmp
   mv /tmp/wordpress/* "/var/www/$domain/"
-
-  local db_name="wp_${domain//./_}"
+  local db_name="wp_$(echo $domain | sed 's/\./_/g; s/-//g')"
   local db_user="${db_name}_user"
   local db_pass=$(dba mysql add $db_name $db_user false)
 
@@ -3696,10 +3885,11 @@ menu_del_sites() {
   rm -rf "/var/www/$domain"
 
   # 刪除資料庫
+  tmp_domain="${domain//./_}"
   if [ $site_type = wp ]; then
-    db_name="wp_${domain//./_}"
+    db_name="wp_$(echo $domain | sed 's/\./_/g; s/-//g')"
   elif [ $site_type = flarum ]; then
-    db_name="flarum_${domain//./_}"
+    db_name="flarum_$(echo $domain | sed 's/\./_/g; s/-//g')"
   fi
   
   if [ $site_type != "unknown" ]; then
@@ -4377,9 +4567,9 @@ case "$1" in
     fi
     exit 0
     ;;
-esac
-if [[ $openresty -eq 1 || $nginx -eq 1 ]]; then
-  show_menu_nginx
-elif [ $caddy -eq 1 ]; then
+esac  
+if [ $caddy -eq 1 ]; then
   show_menu_caddy
+else
+  show_menu_nginx
 fi
