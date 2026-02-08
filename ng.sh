@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.2.0"
+version="8.3.0"
 
 
 # 顏色定義
@@ -325,7 +325,7 @@ detect_nginx_conf_paths(){
     elif [ "$nginx" -eq 1 ]; then
       cmd_bin="nginx"
     fi
-    conf_path=$($cmd_bin -t 2>&1 | sed -n '2s/^nginx: configuration file \(.*\) test.*$/\1/p')
+    conf_path=$($cmd_bin -t 2>&1 | sed -n 's#.*configuration file \([^ ]*\.conf\).*#\1#p' | head -n1)
   fi
 
   echo "$conf_path"
@@ -605,6 +605,7 @@ create_directories() {
   [ $caddy -eq 1 ] && return 0
   mkdir -p /home/web/cert
   mkdir -p /etc/nginx/conf.d/
+  mkdir -p /var/www
 }
 chown_set(){
   local ngx_user=$(get_web_run_user)
@@ -977,9 +978,9 @@ default(){
   create_directories
   generate_ssl_cert
   if [[ "$docker_name" == "openresty" || "$docker_name" == "nginx" ]]; then
-    mkdir -p /etc/nginx/logs
-    touch /etc/nginx/logs/error.log
-    touch /etc/nginx/logs/access.log
+    mkdir -p /var/log/openresty/logs
+    touch /var/log/openresty/error.log
+    touch /var/log/openresty/access.log
     case $system in
     1|2)  id -u nginx &>/dev/null || (groupadd -g 1689 nginx && useradd -u 1689 -g 1689 -s /sbin/nologin -M nginx) ;;
     3)  id -u nginx &>/dev/null || (addgroup -g 1689 nginx && adduser -u 1689 -G nginx -D -H -s /sbin/nologin nginx) ;;
@@ -1694,7 +1695,7 @@ install_wp_plugin_with_search_or_url() {
   echo "正在搜尋包含 \"$input\" 的插件..."
 
   mapfile -t plugins < <(
-    wp --allow-root --path="$site_path" plugin search "$input" --per-page=10 --format=json | jq -r '.[] | "\(.name)|\(.slug)"'
+    wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin search "$input" --per-page=10 --format=json | jq -r '.[] | "\(.name)|\(.slug)"'
   )
 
   if [ ${#plugins[@]} -eq 0 ]; then
@@ -1722,7 +1723,7 @@ install_wp_plugin_with_search_or_url() {
       idx=$((REPLY - 1))
       slug="${slugs[$idx]}"
       echo -e "${CYAN}開始安裝插件：$slug${RESET}"
-      wp --allow-root --path="$site_path" plugin install "$slug" --activate
+      wp --skip-plugins --skip-themes --allow-root --path="$site_path" plugin install "$slug" --activate
       return
     else
       echo -e "${YELLOW}無效的選項，請重新選擇${RESET}"
@@ -1736,12 +1737,13 @@ install_web_server(){
   local os=$(grep -w "^ID" /etc/os-release | cut -d= -f2 | tr -d '"')
   local codename=$(grep -w "^VERSION_CODENAME" /etc/os-release | cut -d= -f2 | tr -d '"')
   if [ $mode == openresty ]; then
-    if [ $other == docker ]; then
+    if [[ "$other" == "docker" ]]; then
       check_web_server
       openresty=1
       docker_name=openresty
       default $mode
       mkdir -p /etc/nginx/conf.d
+      mkdir -p /var/log/openresty
       docker run -d \
         --name openresty \
         --restart always \
@@ -1753,8 +1755,9 @@ install_web_server(){
         -v /run/php:/run/php:ro \
         -v /home/web/cert:/home/web/cert:ro \
         -v /etc/nginx/HttpGuard:/usr/local/openresty/nginx/conf/HttpGuard \
-        -v /etc/nginx/logs/access.log:/usr/local/openresty/nginx/logs/access.log \
-        -v /etc/nginx/logs/error.log:/usr/local/openresty/nginx/logs/error.log \
+        -v /var/log/openresty/access.log:/usr/local/openresty/nginx/logs/access.log \
+        -v /var/log/openresty/error.log:/usr/local/openresty/nginx/logs/error.log \
+        -v /etc/localtime:/etc/localtime:ro \
         gebu8f/openresty:latest
       check_web_server
       return 0
@@ -1763,7 +1766,7 @@ install_web_server(){
     1)
       apt update
       apt install -y curl gnupg2 ca-certificates lsb-release
-      curl -s https://openresty.org/package/pubkey2.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/openresty.gpg
+      curl -s https://openresty.org/package/pubkey.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/openresty.gpg
       if [[ $os == "debian" ]]; then
         echo "deb https://openresty.org/package/debian $codename openresty" | tee /etc/apt/sources.list.d/openresty.list
       elif [[ $os == "kali" ]]; then
@@ -2129,6 +2132,10 @@ php_fix(){
     sed -i -r "s|^;?(listen.group\s*=\s*).*|\1$ngx_user|" /etc/php/$php_var/fpm/pool.d/www.conf
     sed -i -r "s|^;?(listen.mode\s*=\s*).*|\10660|" /etc/php/$php_var/fpm/pool.d/www.conf
     sed -i -r "s|^;?(listen\s*=\s*).*|\1/run/php/php-fpm.sock|" /etc/php/$php_var/fpm/pool.d/www.conf
+    chown -R root:$ngx_user /var/lib/php/sessions
+    chown -R root:$ngx_user /var/lib/php/opcache
+    chown -R root:$ngx_user /var/lib/php/wsdlcache
+    chmod -R 770 /var/lib/php/session /var/lib/php/opcache /var/lib/php/wsdlcache
     chown_set
     systemctl restart php$php_var-fpm
 
@@ -2146,6 +2153,11 @@ php_fix(){
     sed -i "s|^[;[:space:]]*listen.acl_users *=.*|listen.acl_users = $web_users|" /etc/php-fpm.d/www.conf
     sed -i "s|^[;[:space:]]*listen.mode *=.*|listen.mode = 0660|" /etc/php-fpm.d/www.conf
     sed -i "s|^[;[:space:]]*listen *=.*|listen = /run/php/php-fpm.sock|" /etc/php-fpm.d/www.conf
+    
+    chown -R root:$ngx_user /var/lib/php/session
+    chown -R root:$ngx_user /var/lib/php/opcache
+    chown -R root:$ngx_user /var/lib/php/wsdlcache
+    chmod -R 770 /var/lib/php/session /var/lib/php/opcache /var/lib/php/wsdlcache
     chown_set
     systemctl restart php-fpm
 
@@ -2156,6 +2168,10 @@ php_fix(){
     sed -i "s/^;listen.owner =.*/listen.owner = $ngx_user/" /etc/php$php_var/php-fpm.d/www.conf
     sed -i "s/^;listen.group =.*/listen.group = $ngx_user/" /etc/php$php_var/php-fpm.d/www.conf
     sed -i "s/^;listen.mode =.*/listen.mode = 0660/" /etc/php$php_var/php-fpm.d/www.conf
+    chown -R root:$ngx_user /var/lib/php$php_var/sessions
+    chown -R root:$ngx_user /var/lib/php$php_var/opcache
+    chown -R root:$ngx_user /var/lib/php$php_var/wsdlcache
+    chmod -R 770 /var/lib/php$php_var/session /var/lib/php$php_var/opcache /var/lib/php$php_var/wsdlcache
     chown_set
     rc-service php-fpm$php_var restart
   fi
@@ -2554,49 +2570,6 @@ remove_wp_plugin_with_menu() {
   done
 }
 
-# 只列出有自動備份排程的網站，讓用戶選擇移除
-remove_site_backup_cron() {
-  echo "============【 移除網站自動備份排程 】============"
-  local crontab_lines
-  crontab_lines=$(crontab -l 2>/dev/null | grep '/var/www/' || true)
-  if [[ -z "$crontab_lines" ]]; then
-    echo -e "${RED}目前沒有任何網站有自動備份排程。${RESET}"
-    return 1
-  fi
-  # 從 crontab 取唯一網站
-  local sites=()
-  while read -r line; do
-    site=$(echo "$line" | grep -o '/var/www/[^ ]*' | awk -F/ '{print $4}')
-    [[ -n "$site" ]] && sites+=("$site")
-  done <<< "$(echo "$crontab_lines" | sort | uniq)"
-  # 去重
-  local uniq_sites=()
-  local seen=""
-  for s in "${sites[@]}"; do
-    [[ "$seen" =~ " $s " ]] || uniq_sites+=("$s")
-    seen+=" $s "
-  done
-  if [[ ${#uniq_sites[@]} -eq 0 ]]; then
-    echo -e "${RED}沒有偵測到任何網站有自動備份排程。${RESET}"
-    return 1
-  fi
-  echo "可移除排程的網站："
-  local i=1
-  for site in "${uniq_sites[@]}"; do
-    echo "  [$i] $site"
-    ((i++))
-  done
-  read -p "請輸入要移除排程的網站編號：" idx
-  if [[ ! "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#uniq_sites[@]} )); then
-    echo -e "${RED}輸入無效，取消操作。${RESET}"
-    return 1
-  fi
-  local domain="${uniq_sites[$((idx-1))]}"
-  crontab -l 2>/dev/null | grep -v "/var/www/$domain" | crontab -
-  echo -e "${GREEN}已移除 $domain 的自動備份排程（不影響現有備份檔案）。${RESET}"
-}
-
-
 
 reset_wp_site() {
   local domain="$1"
@@ -2630,14 +2603,13 @@ reset_wp_site() {
   echo -e "${GREEN}$domain 已完成緊急重置。可嘗試重新登入後台。${RESET}"
 }
 
-
 restore_site_files() {
   local mode="$1"
   local domain="$2"
-
-  local default_backup_dir="/opt/wp_backups/$domain"
+  local default_backup_dir="/opt/backups/$domain"
   local backup_dir=""
   local archive=""
+  is_db_done=false
 
   # 讓使用者輸入或確認備份檔案所在的目錄
   read -p "請輸入備份檔案所在目錄 [預設: $default_backup_dir]: " backup_dir
@@ -2677,7 +2649,6 @@ restore_site_files() {
     read -p "目錄已存在，是否清空目錄後還原？(y/N): " yn
     case "$yn" in
       [Yy]*) 
-        echo "正在清空 $dest_dir ..."
         rm -rf "${dest_dir:?}"/* 
         ;;
       *) 
@@ -2689,7 +2660,6 @@ restore_site_files() {
 
   mkdir -p "$dest_dir"
 
-  echo -e "${CYAN}正在解壓 $archive ...${RESET}"
   if [[ "$archive" == *.tar.gz ]]; then
     tar -xzf "$archive" -C "$dest_dir"
   elif [[ "$archive" == *.zip ]]; then
@@ -2712,12 +2682,12 @@ restore_site_files() {
   # 根據 system 呼叫不同的 DB restore
   case "$mode" in
     wp)
-      echo -e "${CYAN}WordPress 檔案已還原，繼續執行 WordPress 資料庫還原...${RESET}"
-      restore_site_db "$mode" "$domain"
+      echo -e "${GREEN}WordPress 檔案已還原，執行資料庫還原${RESET}"
+      restore_site_db "$mode" "$domain" "true"
       ;;
     flarum)
-      echo -e "${CYAN}Flarum 檔案已還原，繼續執行 Flarum 資料庫還原...${RESET}"
-      restore_site_db "$mode" "$domain"
+      echo -e "${GREEN}Flarum 檔案已還原，執行資料庫還原${RESET}"
+      restore_site_db "$mode" "$domain" "true"
       ;;
     *)
       echo -e "${YELLOW}尚未支援系統：$mode${RESET}"
@@ -2729,6 +2699,7 @@ restore_site_db() {
   local type="$1"
   local domain="$2"
   local site_path="/var/www/$domain"
+  local is_from_the_files=${3:-false}
   local db_name=""
   local db_user=""
   local db_pass=""
@@ -2798,19 +2769,25 @@ restore_site_db() {
   else
     # 如果只有一個檔案，就自動選擇，無需使用者操作
     sql_to_restore="${sql_files[0]}"
-    echo -e "${CYAN}找到唯一的 SQL 備份檔：$(basename "$sql_to_restore")，將自動進行還原...${RESET}"
   fi
   
-  echo "您選擇了: $(basename "$sql_to_restore")"
-
   # --- 步驟 3: 果斷執行還原 ---
-  echo "正在將 '$(basename "$sql_to_restore")' 匯入至資料庫 '$db_name'..."
 
   if dba mysql import "$db_name" "$db_user" "$db_pass" "$sql_to_restore"; then
     echo -e "${GREEN}資料庫還原成功！${RESET}"
-    # 只有當 SQL 檔案在網站根目錄時才刪除，避免誤刪 /root/mysql_backups 中的檔案
+    local confirm
+    read -p "是否要做更改網域？[Y/n,預設:N]" confirm
+    confirm=${confirm,,}
+    confirm=${confirm:-n}
+    if [ $confirm == y ]; then
+      read -p "請輸入域名[空白是$domain]" db_domain
+      install_wpcli_if_needed
+      wp_change_domains "$db_domain" "$domain"
+    fi
+    if ! $is_db_done && $is_from_the_files; then
+      is_db_done=true
+    fi
     if [[ "$(dirname "$sql_to_restore")" == "$site_path" ]]; then
-        echo "正在清理已還原的 SQL 檔案..."
         rm -f "$sql_to_restore"
     fi
     return 0
@@ -2820,18 +2797,34 @@ restore_site_db() {
   fi
 }
 
+wp_change_domains() {
+  local db_domain="$1"
+  local domain="$2"
+  local old_domain=$(wp option get home --path="/var/www/$domain" --allow-root --skip-plugins --skip-themes)
+  local site_url=$(wp option get siteurl --path="/var/www/$domain" --allow-root --skip-plugins --skip-themes)
+  if [[ "$old_domain" == "$site_url" ]]; then
+    wp search-replace "$old_domain" "https://$db_domain" --skip-plugins --skip-themes --all-tables --precise --skip-columns=guid --path="/var/www/$domain" --allow-root
+    wp cache flush --skip-plugins --skip-themes --path="/var/www/$domain" --allow-root
+    wp rewrite flush --skip-plugins --skip-themes --path="/var/www/$domain" --allow-root
+  fi
+}
+
 set_site_permissions() {
   local mode="$1"
   local dest_dir="$2"
 
   local ngx_user=$(get_web_run_user)
 
-  echo -e "${CYAN}設定檔案擁有者為：$owner${RESET}"
   chown -R $ngx_user:$ngx_user "$dest_dir"
 
-  echo -e "${CYAN}套用預設檔案/資料夾權限...${RESET}"
   find "$dest_dir" -type d -exec chmod 755 {} +
   find "$dest_dir" -type f -exec chmod 644 {} +
+  
+  if [ $system -eq 2 ]; then
+    semanage fcontext -d "$dest_dir(/.*)?" 2>/dev/null
+    semanage fcontext -a -t httpd_sys_rw_content_t "$dest_dir(/.*)?"
+    restorecon -Rv $dest_dir >/dev/null
+  fi
 
   case "$mode" in
     wp)
@@ -2839,7 +2832,7 @@ set_site_permissions() {
       chown -R $ngx_user:$ngx_user "$dest_dir/wp-content"
       find "$dest_dir/wp-content" -type d -exec chmod 775 {} +
       find "$dest_dir/wp-content" -type d -exec chmod g+s {} +
-      [ -f "$dest_dir/wp-config.php" ] && chmod 640 "$dest_dir/wp-config.php"
+      [ -f "$dest_dir/wp-config.php" ] && chown root:$ngx_user $dest_dir/wp-config.php && chmod 740 "$dest_dir/wp-config.php"
       ;;
     flarum)
       mkdir -p "$dest_dir/storage" "$dest_dir/public/assets"
@@ -2942,7 +2935,7 @@ setup_site() {
   case $system in
     1|2|3)
       case $type in
-        html|php|www|flarum|phpmyadmin)
+        html|php|flarum|phpmyadmin)
           local conf_url="https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_${type}.conf"
           wget -O "$conf_file" "$conf_url"
           sed -i -e "s|domain|$domain|g" \
@@ -2969,184 +2962,200 @@ setup_site() {
       ;;
   esac
 }
-show_cert_status() (
-  # 在子 Shell 中執行
-  check_web_environment
-  if [[ $use_my_app != true ]]; then
+show_cert_status() {
+    check_web_environment
+    if [[ $use_my_app != true ]]; then
+        echo -e "===== 站點憑證狀態 ====="
+        echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
+        return 0
+    fi
+
+    # 檢查 Bash 版本
+    if (( BASH_VERSINFO[0] < 4 )); then
+        echo "錯誤：此腳本需要 Bash 4.0+" >&2; return 1
+    fi
+
     echo -e "===== 站點憑證狀態 ====="
-    echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
-    return 0
-  fi
-    
-  echo -e "===== 站點憑證狀態 ====="
-    
-  if (( BASH_VERSINFO[0] < 4 )); then
-      echo "錯誤：此腳本需要 Bash 4.0 或更高版本才能使用關聯陣列。" >&2
-      return 1
-  fi
-    
-  # --- 快取相關設定 ---
-  local CACHE_DIR="/var/cache/site_manager"
-  local NGINX_CACHE_FILE="$CACHE_DIR/nginx_domains.cache"
-  mkdir -p "$CACHE_DIR"
-    
-  local nginx_conf_paths=$(detect_conf_path)
-    
-  # --- 1. Nginx 配置解析 (帶智慧快取) ---
-  declare -A domain_to_cert_path
-    
-  local nginx_last_mod=0
-  [ -d "$nginx_conf_paths" ] && nginx_last_mod=$(stat -c %Y "$nginx_conf_paths")
-  local cache_last_mod=0
-  [ -f "$NGINX_CACHE_FILE" ] && cache_last_mod=$(stat -c %Y "$NGINX_CACHE_FILE")
-    
-  # 判斷是否讀取快取
-  if (( cache_last_mod > nginx_last_mod )); then
-    while IFS='|' read -r domain cert_path; do
-      # [修復重點 1] 絕對防禦：如果讀到空行或 domain 是空的，立刻跳過
-      [[ -z "$domain" || -z "$cert_path" ]] && continue
-      domain_to_cert_path["$domain"]="$cert_path"
-    done < "$NGINX_CACHE_FILE"
-  else
-    local server_configs
-    # 嘗試解析，並過濾掉錯誤訊息
-    server_configs=$(awk '/server_name/,/ssl_certificate /' "$nginx_conf_paths"/*.conf 2>/dev/null | grep -E "server_name|ssl_certificate ")
-    
-    local current_domains=""
-    > "$NGINX_CACHE_FILE"
-    
-    # 如果 server_configs 是空的，這裡就不會執行，自然安全
-    if [[ -n "$server_configs" ]]; then
-        while IFS= read -r line; do
-          if [[ $line =~ server_name ]]; then
-            current_domains=$(echo "$line" | sed -e 's/server_name//' -e 's/;//' | xargs)
-          elif [[ $line =~ ssl_certificate && -n "$current_domains" ]]; then
-            local cert_path
-            cert_path=$(echo "$line" | awk '{print $2}' | sed 's/;//')
-            for domain in $current_domains; do
-              # [修復重點 2] 只有當 domain 真的是有內容時才寫入陣列
-              if [[ "$cert_path" == /etc/letsencrypt/live/* && -n "$domain" ]]; then
-                domain_to_cert_path["$domain"]="$cert_path"
-                echo "$domain|$cert_path" >> "$NGINX_CACHE_FILE"
-              fi
-            done
-            current_domains=""
-          fi
-        done <<< "$server_configs"
-    fi
-  fi
-    
-  # --- [修復重點 3] 關鍵檢查：如果上面跑完，陣列裡什麼都沒有，直接結束 ---
-  # 這樣就不會去跑下面的迴圈，避免對空陣列操作報錯
-  if [ ${#domain_to_cert_path[@]} -eq 0 ]; then
-    echo -e "${GREEN}目前沒有偵測到任何使用 Let's Encrypt 的域名。${RESET}"
-    return 0
-  fi
 
-  # --- 2. 處理憑證資訊 (帶記憶體內 openssl 快取) ---
-  declare -A cert_cache 
-  declare -A domain_data
+    local CACHE_DIR="/tmp/site_manager_cert_cache"
+    mkdir -p "$CACHE_DIR"
     
-  local nginx_domains
-  # 因為上面已經檢查過陣列長度不為0，這裡 mapfile 就不會出錯
-  mapfile -t nginx_domains < <(printf "%s\n" "${!domain_to_cert_path[@]}" | sort -u)
-    
-  for domain in "${nginx_domains[@]}"; do
-    # 再次確認 domain 非空 (雙重保險)
-    [[ -z "$domain" ]] && continue
+    local NGINX_MAP_CACHE="$CACHE_DIR/nginx_domain_map.cache" # 存: 域名|憑證路徑
+    local SSL_DATE_CACHE="$CACHE_DIR/ssl_date_info.cache" # 存: 憑證路徑|到期日|備註|更新時間戳
+    local SSL_CACHE_TTL=259200
+    local nginx_conf_paths=$(detect_conf_path)
+    local current_ts=$(date +%s)
+    declare -A domain_map
+    local nginx_mod_time=0
+    [[ -d "$nginx_conf_paths" ]] && nginx_mod_time=$(stat -c %Y "$nginx_conf_paths")
+    local map_mod_time=0
+    [[ -f "$NGINX_MAP_CACHE" ]] && map_mod_time=$(stat -c %Y "$NGINX_MAP_CACHE")
 
-    local cert_path="${domain_to_cert_path[$domain]}"
-    local cert_name=$(basename "$(dirname "$cert_path")")
-    local note=""
-    local end_date=""
-    
-    # 避免 cert_path 為空導致 cert_cache 報錯
-    if [[ -z "$cert_path" ]]; then continue; fi
-
-    if [[ -n "${cert_cache[$cert_path]}" ]]; then
-      IFS='|' read -r end_date note <<< "${cert_cache[$cert_path]}"
+    if (( map_mod_time >= nginx_mod_time )); then
+        while IFS='|' read -r dom path; do
+            [[ -n "$dom" && -n "$path" ]] && domain_map["$dom"]="$path"
+        done < "$NGINX_MAP_CACHE"
     else
-      if [[ -f "$cert_path" ]]; then
-        local cert_info
-        cert_info=$(openssl x509 -in "$cert_path" -noout -enddate -issuer 2>/dev/null)
-            
-        if [[ -n "$cert_info" ]]; then
-          local end_date_raw=$(echo "$cert_info" | grep 'notAfter' | cut -d= -f2)
-          end_date=$([[ -n "$end_date_raw" ]] && date -d "$end_date_raw" +"%Y-%m-%d" || echo "無效日期")
-              
-          local issuer
-          issuer=$(echo "$cert_info" | grep 'issuer' | sed 's/issuer=//')
-          if [[ ${issuer,,} == *cloudflare* ]]; then 
-            note="CF 原始憑證"
-          fi
-              
-          cert_cache["$cert_path"]="$end_date|$note"
-        else
-          end_date="讀取失敗"
+        local server_configs
+        server_configs=$(awk '/server_name/,/ssl_certificate /' "$nginx_conf_paths"/*.conf 2>/dev/null | grep -E "server_name|ssl_certificate ")
+        
+        local cur_domains=""
+        > "$NGINX_MAP_CACHE" # 清空重建
+
+        if [[ -n "$server_configs" ]]; then
+            while IFS= read -r line; do
+                if [[ $line =~ server_name ]]; then
+                    cur_domains=$(echo "$line" | sed -e 's/server_name//' -e 's/;//' | xargs)
+                elif [[ $line =~ ssl_certificate && -n "$cur_domains" ]]; then
+                    local c_path=$(echo "$line" | awk '{print $2}' | sed 's/;//')
+                    if [[ "$c_path" == /etc/letsencrypt/live/* ]]; then
+                        for d in $cur_domains; do
+                            [[ -n "$d" ]] && domain_map["$d"]="$c_path" && echo "$d|$c_path" >> "$NGINX_MAP_CACHE"
+                        done
+                    fi
+                    cur_domains=""
+                fi
+            done <<< "$server_configs"
         fi
-      else
-        end_date="檔案不存在"
-      fi
-      [[ -z "${cert_cache[$cert_path]}" ]] && cert_cache["$cert_path"]="$end_date|$note"
     fi
-    domain_data["$domain"]="$end_date|$cert_name|$note"
-  done
-    
-  # --- 3. 渲染輸出 ---
-  display_width() {
-    local str="$1"; local width=0; local i=0
-    while [ $i -lt ${#str} ]; do
-      local char="${str:$i:1}"
-      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then width=$((width + 2)); else width=$((width + 1)); fi
-      i=$((i + 1)); done; echo $width
-  }
-  pad_left() {
-    local text="$1"; local max_width="$2"
-    local current_width=$(display_width "$text"); local padding=$((max_width - current_width))
-    printf "%s%*s" "$text" $padding ""
-  }
-    
-  local headers=("域名" "到期日" "憑證資料夾" "備註")
-  local -a max_widths=()
-  for header in "${headers[@]}"; do max_widths+=($(display_width "$header")); done
-    
-  local -a data_rows
-  for domain in "${nginx_domains[@]}"; do
-    [[ -z "$domain" ]] && continue
-    IFS='|' read -r end_date cert_name note <<< "${domain_data[$domain]}"
-    if [ -z "$end_date" ]; then
-      end_date="無憑證"; cert_name="-"; note=""
+
+    if [ ${#domain_map[@]} -eq 0 ]; then
+        echo -e "${GREEN}目前沒有偵測到任何使用 Let's Encrypt 的域名。${RESET}"
+        return 0
     fi
-    data_rows+=("$domain|$end_date|$cert_name|$note")
-    local -a current_row_data=("$domain" "$end_date" "$cert_name" "$note")
-    for i in "${!max_widths[@]}"; do
-      local current_width=$(display_width "${current_row_data[$i]}");
-      if [[ $current_width -gt ${max_widths[$i]} ]]; then max_widths[$i]=$current_width; fi
+
+    declare -A ssl_cache_data
+    local cache_dirty=false
+
+    if [[ -f "$SSL_DATE_CACHE" ]]; then
+        while IFS='|' read -r p d n t; do
+            ssl_cache_data["$p"]="$d|$n|$t"
+        done < "$SSL_DATE_CACHE"
+    fi
+
+    declare -A unique_paths
+    for d in "${!domain_map[@]}"; do unique_paths["${domain_map[$d]}"]=1; done
+
+    for path in "${!unique_paths[@]}"; do
+        if [[ ! -f "$path" ]]; then
+          ssl_cache_data["$path"]="檔案遺失|需檢查|$current_ts"
+          continue
+        fi
+
+        # 檢查記憶體快取
+        local cached_info="${ssl_cache_data[$path]}"
+        local need_update=true
+
+        if [[ -n "$cached_info" ]]; then
+            IFS='|' read -r _ _ last_ts <<< "$cached_info"
+            # 檢查是否過期 (3天)
+            if (( (current_ts - last_ts) < SSL_CACHE_TTL )); then
+                need_update=false
+            fi
+        fi
+
+        if [[ "$need_update" == true ]]; then
+            local end_date="讀取失敗"
+            local note=""
+            local cert_out
+            
+            cert_out=$(openssl x509 -in "$path" -noout -enddate -issuer 2>/dev/null)
+            
+            if [[ -n "$cert_out" ]]; then
+                local raw_date=$(echo "$cert_out" | grep 'notAfter' | cut -d= -f2)
+                [[ -n "$raw_date" ]] && end_date=$(date -d "$raw_date" +"%Y-%m-%d")
+                
+                if echo "$cert_out" | grep -q "CloudFlare"; then note="CF 原始憑證"; fi
+            fi
+            
+            ssl_cache_data["$path"]="$end_date|$note|$current_ts"
+            cache_dirty=true
+        fi
     done
-  done
+
+    if [[ "$cache_dirty" == true ]]; then
+        > "$SSL_DATE_CACHE"
+        for p in "${!ssl_cache_data[@]}"; do
+            echo "$p|${ssl_cache_data[$p]}" >> "$SSL_DATE_CACHE"
+        done
+    fi
+
     
-  # 顯示表頭
-  for i in "${!headers[@]}"; do
-    pad_left "${headers[$i]}" "${max_widths[$i]}";
-    if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " | "; fi;
-  done; printf "\n"
+    display_width() {
+        local str="$1"
+        if [[ "$str" =~ ^[[:ascii:]]*$ ]]; then
+            echo ${#str}
+        else
+            local w=0; local i=0; local len=${#str}
+            while [ $i -lt $len ]; do
+                local c="${str:$i:1}"
+                if [[ $(printf "%d" "'$c") -gt 127 ]] 2>/dev/null; then w=$((w+2)); else w=$((w+1)); fi
+                ((i++))
+            done
+            echo $w
+        fi
+    }
+
+    pad_out() {
+        local str="$1"; local max="$2"
+        local w=$(display_width "$str")
+        local pad=$((max - w))
+        printf "%s%*s" "$str" $pad ""
+    }
+
+    # 準備資料與計算寬度
+    local headers=("域名" "到期日" "憑證資料夾" "備註")
+    local -a widths=(4 6 10 4) # 預設最小值
+    local -a rows=()
     
-  local total_width=0
-  for i in "${!max_widths[@]}"; do
-    total_width=$((total_width + max_widths[i]));
-    if [[ $i -lt $((${#headers[@]} - 1)) ]]; then total_width=$((total_width + 3)); fi;
-  done; printf '%.0s-' $(seq 1 $total_width); printf "\n"
-    
-  # 顯示資料
-  for row in "${data_rows[@]}"; do
-    IFS='|' read -r domain date cert note <<< "$row"
-    local -a fields=("$domain" "$date" "$cert" "$note")
-    for i in "${!fields[@]}"; do
-      pad_left "${fields[$i]}" "${max_widths[$i]}";
-      if [[ $i -lt $((${#headers[@]} - 1)) ]]; then printf " | "; fi;
-    done; printf "\n"
-  done
-)
+    # 排序域名
+    local -a sorted_domains
+    mapfile -t sorted_domains < <(printf "%s\n" "${!domain_map[@]}" | sort)
+
+    for domain in "${sorted_domains[@]}"; do
+        [[ -z "$domain" ]] && continue
+        
+        local path="${domain_map[$domain]}"
+        local cert_name=$(basename "$(dirname "$path")")
+        local info="${ssl_cache_data[$path]}"
+        
+        IFS='|' read -r e_date note _ <<< "$info"
+        [[ -z "$e_date" ]] && e_date="${RED}未知${RESET}"
+
+        if [[ "$e_date" == "檔案遺失" ]]; then e_date="${RED}檔案遺失${RESET}"; fi
+
+        rows+=("$domain|$e_date|$cert_name|$note")
+        
+        # 更新欄寬 (只算去色後的長度)
+        local raw_vals=("$domain" "$(echo "$e_date" | sed 's/\x1b\[[0-9;]*m//g')" "$cert_name" "$note")
+        for i in {0..3}; do
+            local w=$(display_width "${raw_vals[$i]}")
+            [[ $w -gt ${widths[$i]} ]] && widths[$i]=$w
+        done
+    done
+
+    # 輸出表頭
+    for i in {0..3}; do
+        pad_out "${headers[$i]}" "${widths[$i]}"
+        [[ $i -lt 3 ]] && printf " | "
+    done
+    echo ""
+
+    # 分隔線
+    local total_w=0
+    for w in "${widths[@]}"; do ((total_w+=w)); done
+    ((total_w+=9)) # 3個分隔符 " | " 各3字元
+    printf '%.0s-' $(seq 1 $total_w); echo ""
+
+    # 輸出內容
+    for row in "${rows[@]}"; do
+        IFS='|' read -r d e c n <<< "$row"
+        pad_out "$d" "${widths[0]}"; printf " | "
+        pad_out "$e" "${widths[1]}"; printf " | "
+        pad_out "$c" "${widths[2]}"; printf " | "
+        pad_out "$n" "${widths[3]}"; echo ""
+    done
+}
 
 show_domain_status_caddy() (
   echo "===== Caddy 站點域名列表 ====="
@@ -3238,36 +3247,30 @@ show_httpguard_status(){
 
 show_php() {
   local wp_root="/var/www"
+
   echo "===== 已安裝 PHP 網站列表 ====="
   printf "%-20s | %-10s\n" "網址" "備註"
   echo "-------------------------------------------"
 
-  # 使用 find 命令高效地找出所有符合基本條件的候選目錄
-  # -mindepth 1 -maxdepth 1: 只搜尋 /var/www 的下一層，不深入
-  # -type d: 只尋找目錄
-  # -name '*.*': 目錄名稱必須包含 . (初步過濾)
-  # -print0: 使用 NULL 字元分隔結果，處理包含空格等特殊字元的目錄名
+  [[ -d "$wp_root" ]] || return 0
+
   find "$wp_root" -mindepth 1 -maxdepth 1 -type d -name '*.*' -print0 | \
   while IFS= read -r -d '' site_dir; do
-    # find 已經幫我們完成了初步篩選，現在只需對候選目錄進行深度檢查
 
-    # 必須有 index.php 才處理
-    if [[ ! -f "$site_dir/index.php" ]]; then
-      continue
-    fi
+    [[ -f "$site_dir/index.php" ]] || continue
 
-    # basename 已不再是瓶頸，可以安全使用
     local site_name
     site_name=$(basename "$site_dir")
-    
+
     local remark="PHP網站"
 
-    # 應用識別邏輯，這部分是無法避免的檢查，且原始寫法已相當優化 (利用 || 短路特性)
     if [[ -f "$site_dir/wp-config.php" ]]; then
       remark="WordPress"
-    elif [[ -f "$site_dir/public/assets/forum.js" ]] || grep -qi "flarum" "$site_dir/index.php" 2>/dev/null; then
+    elif [[ -f "$site_dir/public/assets/forum.js" ]] || \
+         grep -qi "flarum" "$site_dir/index.php" 2>/dev/null; then
       remark="Flarum"
-    elif [[ -f "$site_dir/usr/index.php" ]] || grep -qi "Typecho" "$site_dir/index.php" 2>/dev/null; then
+    elif [[ -f "$site_dir/usr/index.php" ]] || \
+         grep -qi "Typecho" "$site_dir/index.php" 2>/dev/null; then
       remark="Typecho"
     fi
 
@@ -3422,10 +3425,20 @@ ssl_apply() {
   esac
 
   mkdir -p "$target_dir"
+  local reload_cmd=""
+  if [ -n "$docker_name" ]; then
+    reload_cmd="docker restart $docker_name"
+  else
+    # 根據 system 判斷
+    case "$system" in
+    1|2) reload_cmd="systemctl reload nginx || systemctl reload openresty" ;;
+    3) reload_cmd="rc-service nginx reload" ;;
+    esac
+  fi
   acme.sh --install-cert -d "$main_domain" \
     --fullchain-file "$target_dir/fullchain.pem" \
     --key-file       "$target_dir/privkey.pem" \
-    --reloadcmd      "service openresty restart 2>/dev/null || service nginx restart 2>/dev/null"
+    --reloadcmd      "$reload_cmd"
 
   echo -e "${GREEN}證書申請與安裝完成！${RESET}"
 }
@@ -3620,44 +3633,48 @@ wordpress_site() {
   restore_file=${restore_file,,}
   if [[ $restore_file == "y" || $restore_file == "" ]]; then
     restore_site_files wp "$domain"
-    return 0
-  fi
-  # 下載 WordPress 並部署
-  mkdir -p "/var/www/$domain"
-  curl -L https://wordpress.org/latest.zip -o /tmp/wordpress.zip
-  unzip /tmp/wordpress.zip -d /tmp
-  mv /tmp/wordpress/* "/var/www/$domain/"
-  local db_name="wp_$(echo $domain | sed 's/\./_/g; s/-//g')"
-  local db_user="${db_name}_user"
-  local db_pass=$(dba mysql add $db_name $db_user false)
-
-  # 設定 wp-config.php
-  cp "/var/www/$domain/wp-config-sample.php" "/var/www/$domain/wp-config.php"
-  sed -i "s/database_name_here/$db_name/" "/var/www/$domain/wp-config.php"
-  sed -i "s/username_here/$db_user/" "/var/www/$domain/wp-config.php"
-  sed -i "s/password_here/$db_pass/" "/var/www/$domain/wp-config.php"
-  sed -i "s/localhost/localhost/" "/var/www/$domain/wp-config.php"
-  # 安全金鑰
-  if command -v wp >/dev/null 2>&1; then
-    wp config shuffle-salts --path="/var/www/$domain" --allow-root
   else
-    curl -s https://api.wordpress.org/secret-key/1.1/salt/ > /tmp/wp_salts.txt
-    sed -i "/define.*'AUTH_KEY'/i WP_SALTS" "/var/www/$domain/wp-config.php"
-    sed -i "/put your unique phrase here/d" "/var/www/$domain/wp-config.php"
-    sed -i "/WP_SALTS/r /tmp/wp_salts.txt" "/var/www/$domain/wp-config.php"
-    sed -i "/WP_SALTS/d" "/var/www/$domain/wp-config.php"
-    rm -f /tmp/wp_salts.txt
+    # 下載 WordPress 並部署
+    mkdir -p "/var/www/$domain"
+    curl -L https://wordpress.org/latest.zip -o /tmp/wordpress.zip
+    unzip /tmp/wordpress.zip -d /tmp
+    mv /tmp/wordpress/* "/var/www/$domain/"
+    local db_name="wp_$(echo $domain | sed 's/\./_/g; s/-//g')"
+    local db_user="${db_name}_user"
+    local db_pass=$(dba mysql add $db_name $db_user false)
+
+    # 設定 wp-config.php
+    cp "/var/www/$domain/wp-config-sample.php" "/var/www/$domain/wp-config.php"
+    sed -i "s/database_name_here/$db_name/" "/var/www/$domain/wp-config.php"
+    sed -i "s/username_here/$db_user/" "/var/www/$domain/wp-config.php"
+    sed -i "s/password_here/$db_pass/" "/var/www/$domain/wp-config.php"
+    sed -i "s/localhost/localhost/" "/var/www/$domain/wp-config.php"
+    # 安全金鑰
+    if command -v wp >/dev/null 2>&1; then
+      wp config shuffle-salts --path="/var/www/$domain" --allow-root
+    else
+      curl -s https://api.wordpress.org/secret-key/1.1/salt/ > /tmp/wp_salts.txt
+      sed -i "/define.*'AUTH_KEY'/i WP_SALTS" "/var/www/$domain/wp-config.php"
+      sed -i "/put your unique phrase here/d" "/var/www/$domain/wp-config.php"
+      sed -i "/WP_SALTS/r /tmp/wp_salts.txt" "/var/www/$domain/wp-config.php"
+      sed -i "/WP_SALTS/d" "/var/www/$domain/wp-config.php"
+      rm -f /tmp/wp_salts.txt
+    fi
+    # 設定權限
+    chown -R $ngx_user:$ngx_user "/var/www/$domain"
   fi
-  # 設定權限
-  chown -R $ngx_user:$ngx_user "/var/www/$domain"
   setup_site "$domain" php
-  read -p "是否要導入現有 SQL 資料？(Y/N): " import_sql
-  import_sql=${import_sql,,}
-  if [[ $import_sql == "y" || $import_sql == "" ]]; then
-    restore_site_db wp $domain
-    return 0
+  if ! is_db_done; then
+    read -p "是否要導入現有 SQL 資料？(Y/N): " import_sql
+    import_sql=${import_sql,,}
+    if [[ $import_sql == "y" || $import_sql == "" ]]; then
+      restore_site_db wp $domain
+      return 0
+    fi
+  else
+    unset is_db_done
   fi
-  echo "WordPress 網站 $domain 建立完成！請瀏覽 https://$domain 開始安裝流程。"
+  echo "WordPress 網站 $domain 建立完成！請瀏覽 https://$domain。"
 }
 
 
