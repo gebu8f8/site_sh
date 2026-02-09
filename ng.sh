@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.3.0"
+version="8.3.1"
 
 
 # 顏色定義
@@ -52,15 +52,20 @@ check_system(){
   if command -v apt >/dev/null 2>&1; then
     system=1
   elif command -v dnf >/dev/null 2>&1; then
-    system=2
     if grep -q -Ei "release 7|release 8" /etc/redhat-release; then
       echo -e "${RED}不支援 CentOS 7 或 CentOS 8，請升級至 9 系列 (Rocky/Alma/CentOS Stream)${RESET}"
       exit 1
     fi
+    if command -v getenforce >/dev/null 2>&1; then
+      if [ "$(getenforce)" == "Enforcing" ]; then
+        selinux_enforcing=true
+      fi
+    fi
+    system=2
   elif command -v apk >/dev/null 2>&1; then
     system=3
-   else
-    echo -e "${RED}不支援的系統。${RESET}" >&2
+  else
+    echo -e "${RED}不支援的系統。${RESET}"
     exit 1
   fi
 }
@@ -191,6 +196,14 @@ check_app(){
     2)  dnf install -y iproute ;;
     3)  apk add iproute2 ;;
     esac
+  fi
+  if $selinux_enforcing; then
+    if ! command -v semanage >/dev/null 2>&1; then
+      dnf install -y policycoreutils-python-utils
+    fi
+    if ! command -v getfacl >/dev/null 2>&1; then
+      dnf install -y acl
+    fi
   fi
 }
 
@@ -1400,28 +1413,8 @@ flarum_setup() {
   echo "已安裝繁體與簡體中文語系，可至 Flarum 後台 Extensions 啟用。"
 
   chown -R $ngx_user:$ngx_user "/var/www/$domain"
+  rhel_selinux_enforcing_permissions "/var/www/$domain"
   setup_site "$domain" flarum
-
-  if grep -qE '^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=' "$php_ini"; then
-    local current_revalidate_freq
-    current_revalidate_freq=$(grep -E '^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=' "$php_ini" | \
-      awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')
-
-    if [ "$current_revalidate_freq" = "0" ]; then
-      sed -i 's/^[[:space:]]*opcache\.revalidate_freq[[:space:]]*=.*/opcache.revalidate_freq=1/' "$php_ini"
-    fi
-  fi
-
-  # 檢查並處理 opcache.validate_timestamps
-  if grep -qE '^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=' "$php_ini"; then
-    local current_validate_timestamps
-    current_validate_timestamps=$(grep -E '^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=' "$php_ini" | \
-      awk -F= '{gsub(/[[:space:]]/,"",$2); print $2}')
-
-    if [ "$current_validate_timestamps" = "0" ]; then
-      sed -i 's/^[[:space:]]*opcache\.validate_timestamps[[:space:]]*=.*/opcache.validate_timestamps=2/' "$php_ini"
-    fi
-  fi
   
   case $system in
   1)
@@ -2140,8 +2133,10 @@ php_fix(){
     systemctl restart php$php_var-fpm
 
   elif [ $system -eq 2 ]; then  # CentOS/RHEL
-    semanage fcontext -a -t httpd_var_run_t "/run/php(/.*)?"
-    restorecon -Rv /run/php
+    if $selinux_enforcing; then
+      semanage fcontext -a -t httpd_var_run_t "/run/php(/.*)?"
+      restorecon -Rv /run/php
+    fi
     echo "d /run/php 0755 nginx nginx - -" | sudo tee /etc/tmpfiles.d/php-fpm-custom.conf
     systemd-tmpfiles --create /etc/tmpfiles.d/php-fpm-custom.conf
     local web_users="nginx,apache"
@@ -2809,6 +2804,25 @@ wp_change_domains() {
   fi
 }
 
+rhel_selinux_enforcing_permissions() {
+  local domain_path="$1"
+  if $selinux_enforcing; then
+    semanage fcontext -d "$domain_path(/.*)?" 2>/dev/null
+    semanage fcontext -a -t httpd_sys_rw_content_t "$domain_path(/.*)?"
+    restorecon -Rv $domain_path >/dev/null
+  fi
+}
+
+rhel_selinux_cleanup_permissions() {
+  local domain_path="$1"
+  if $selinux_enforcing; then
+    semanage fcontext -d "$domain_path(/.*)?" 2>/dev/null
+    if [ -d "$domain_path" ]; then
+      restorecon -Rv "$domain_path" >/dev/null
+    fi
+  fi
+}
+
 set_site_permissions() {
   local mode="$1"
   local dest_dir="$2"
@@ -2820,7 +2834,7 @@ set_site_permissions() {
   find "$dest_dir" -type d -exec chmod 755 {} +
   find "$dest_dir" -type f -exec chmod 644 {} +
   
-  if [ $system -eq 2 ]; then
+  if $selinux_enforcing; then
     semanage fcontext -d "$dest_dir(/.*)?" 2>/dev/null
     semanage fcontext -a -t httpd_sys_rw_content_t "$dest_dir(/.*)?"
     restorecon -Rv $dest_dir >/dev/null
@@ -3661,6 +3675,7 @@ wordpress_site() {
       rm -f /tmp/wp_salts.txt
     fi
     # 設定權限
+    rhel_selinux_enforcing_permissions "/var/www/$domain"
     chown -R $ngx_user:$ngx_user "/var/www/$domain"
   fi
   setup_site "$domain" php
@@ -3899,15 +3914,16 @@ menu_del_sites() {
 
   # 刪除配置與網站資料夾
   rm -rf "$conf_file"
-  rm -rf "/var/www/$domain"
+  rhel_selinux_cleanup_permissions "/var/www/$domain"
 
   # 刪除資料庫
-  tmp_domain="${domain//./_}"
   if [ $site_type = wp ]; then
-    db_name="wp_$(echo $domain | sed 's/\./_/g; s/-//g')"
+    db_name=$(awk -F"'" '/DB_NAME/{print $4}' "/var/www/$domain/wp-config.php")
   elif [ $site_type = flarum ]; then
-    db_name="flarum_$(echo $domain | sed 's/\./_/g; s/-//g')"
+    db_name=$(php -r "\$c = include "/var/www/$domain/config.php"; echo \$c['database']['database'] ?? '';")
   fi
+  
+  rm -rf "/var/www/$domain"
   
   if [ $site_type != "unknown" ]; then
     if ! command -v dba >/dev/null 2>&1; then
@@ -4274,6 +4290,7 @@ menu_php() {
           echo "<?php echo 'Hello from your PHP site!'; ?>" > "/var/www/$domain/index.php"
         fi
         chown -R $ngx_user:$ngx_user "/var/www/$domain"
+        rhel_selinux_enforcing_permissions "/var/www/$domain"
         setup_site "$domain" php
         read -p "操作完成，請按任意鍵繼續..." -n1
         ;;
