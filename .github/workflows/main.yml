@@ -99,7 +99,7 @@ jobs:
             --arg system_msg "請用繁體中文，根據以下 diff 寫出 changelog 條列，不要開場白、不要說明文字、也不要提到版本更新，也不要提到 diff，僅條列變更項目，簡短扼要。條列時請使用 - 作為項目前綴符號。" \
             --arg user_msg "$diff_text" \
             '{
-              model: "deepseek/DeepSeek-V3-0324",
+              model: "openai/gpt-4.1",
               messages: [
                 {"role": "system", "content": $system_msg},
                 {"role": "user", "content": $user_msg}
