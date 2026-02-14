@@ -27,14 +27,18 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.3.1"
+version="8.3.2"
 
+#變量
+CURRENT_PAGE_NGINX=1
+TOTAL_PAGES_NGINX=1
 
 # 顏色定義
 RED="\033[1;31m"    # ❌ 錯誤用紅色
 GREEN="\033[1;32m"   # ✅ 成功用綠色
 YELLOW='\033[1;33m'  # ⚠️ 警告用黃色
 CYAN="\033[1;36m"    # ℹ️ 一般提示用青色
+GRAY='\033[0;90m'
 RESET='\033[0m'      # 清除顏色
 
 phpini_path()(
@@ -71,14 +75,31 @@ check_system(){
 }
 
 check_and_start_service() {
+  local service_name=""
+  
+  # 1. 確定服務名稱 (保持不變)
   if command -v openresty >/dev/null 2>&1; then
-    local service_name=openresty
+    service_name="openresty"
   elif command -v nginx >/dev/null 2>&1; then
-    local service_name=nginx
+    service_name="nginx"
   fi
 
-  if service "$service_name" status >/dev/null 2>&1; then
-    service "$service_name" start
+  if [ -n "$service_name" ]; then
+    case "$system" in
+      1|2)
+        if ! systemctl is-active --quiet "$service_name"; then
+          systemctl start "$service_name"
+        fi
+        ;;
+
+      3)
+        if service -e "$service_name" >/dev/null 2>&1; then
+          if ! service "$service_name" status 2>/dev/null | grep -q 'started'; then
+            service "$service_name" start
+          fi
+        fi
+        ;;
+    esac
   fi
 }
 
@@ -145,65 +166,54 @@ check_cert() {
 }
 
 check_app(){
-  declare -A pkg_map=(
-    ["wget"]="wget"
-    ["jq"]="jq"
-    ["nano"]="nano"
-    ["openssl"]="openssl"
-  )
-  if [ $system -eq 2 ]; then
-    if ! [ -f /etc/fedora-release ]; then
-      if ! dnf repolist enabled | grep -q "epel"; then
-        dnf install -y epel-release
-      fi
+  local install_list=""
+  
+  if [ "$system" -eq 2 ] && [ ! -f /etc/fedora-release ]; then
+    if [ ! -f /etc/yum.repos.d/epel.repo ]; then
+       dnf install -y epel-release
     fi
   fi
-  for cmd in "${!pkg_map[@]}"; do
+
+  for cmd in wget jq nano openssl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-      pkg="${pkg_map[$cmd]}"
-      case "$system" in
-      1) apt update -qq && apt install -y "$pkg" ;;
-      2) dnf update && dnf install -y "$pkg" ;;
-      esac
+      install_list+=" $cmd"
     fi
   done
-  if ! command -v lsb_release &>/dev/null; then
+
+  if ! command -v lsb_release >/dev/null 2>&1; then
+      install_list+=" lsb-release"
+  fi
+
+  if ! command -v dig >/dev/null 2>&1; then
     case $system in
-    1)
-      apt update && apt install -y lsb-release
-      ;;
-    2)
-      dnf install -y lsb-release
-      ;;
+      1) install_list+=" dnsutils" ;;
+      2) install_list+=" bind-utils" ;;
+      3) install_list+=" bind-tools" ;;
     esac
   fi
-  if ! command -v dig &>/dev/null; then
+
+  if ! command -v ss >/dev/null 2>&1; then
     case $system in
-    1)
-      apt update && apt install -y dnsutils
-      ;;
-    2)
-      dnf install -y bind-utils
-      ;;
-    3)
-      apk add bind-tools
-      ;;
+      1|3) install_list+=" iproute2" ;;
+      2)   install_list+=" iproute" ;;
     esac
   fi
-  if ! command -v ss &>/dev/null; then
-    case $system in
-    1)  apt update && apt install -y iproute2 ;;
-    2)  dnf install -y iproute ;;
-    3)  apk add iproute2 ;;
-    esac
-  fi
-  if $selinux_enforcing; then
+
+  if [ "$system" -eq 2 ] && [ "$selinux_enforcing" = true ]; then
     if ! command -v semanage >/dev/null 2>&1; then
-      dnf install -y policycoreutils-python-utils
+      install_list+=" policycoreutils-python-utils"
     fi
     if ! command -v getfacl >/dev/null 2>&1; then
-      dnf install -y acl
+      install_list+=" acl"
     fi
+  fi
+
+  if [ -n "$install_list" ]; then
+    case "$system" in
+      1) apt update && apt install -y $install_list ;;
+      2) dnf install -y $install_list ;;
+      3) apk add $install_list ;;
+    esac
   fi
 }
 
@@ -290,24 +300,20 @@ check_web_server() {
   nginx=0
   caddy=0
   docker_name=""
-
-  # --- host binary 檢測 ---
   command -v openresty >/dev/null 2>&1 && openresty=1
   command -v nginx    >/dev/null 2>&1 && nginx=1
   command -v caddy    >/dev/null 2>&1 && caddy=1
-
-  # --- docker container 檢測 ---
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    # 只抓「正在跑」的 container 名稱
-    containers="$(docker ps --format '{{.Names}}')"
-
-    if echo "$containers" | grep -qi 'openresty'; then
+  
+  if [ -S /var/run/docker.sock ]; then
+    local containers
+    containers=$(docker ps --format '{{.Names}}')
+    if [[ "$containers" =~ "openresty" ]]; then
       openresty=1
       docker_name="openresty"
-    elif echo "$containers" | grep -qi 'nginx'; then
+    elif [[ "$containers" =~ "nginx" ]]; then
       nginx=1
       docker_name="nginx"
-    elif echo "$containers" | grep -qi 'caddy'; then
+    elif [[ "$containers" =~ "caddy" ]]; then
       caddy=1
       docker_name="caddy"
     fi
@@ -2976,199 +2982,246 @@ setup_site() {
       ;;
   esac
 }
-show_cert_status() {
-    check_web_environment
-    if [[ $use_my_app != true ]]; then
-        echo -e "===== 站點憑證狀態 ====="
-        echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
-        return 0
-    fi
+get_input_or_nav() {
+  local input_buffer=""
+    
+  stty -echo 
 
-    # 檢查 Bash 版本
-    if (( BASH_VERSINFO[0] < 4 )); then
-        echo "錯誤：此腳本需要 Bash 4.0+" >&2; return 1
+  while true; do
+    read -rsn1 key # 讀取一個字元
+    if [[ "$key" == $'\e' ]]; then
+      read -rsn2 -t 0.01 key_rest
+      if [[ "$key_rest" == "[C" ]]; then
+        stty echo
+        echo "NAV_NEXT" # 這是給變數抓的結果
+        return
+      elif [[ "$key_rest" == "[D" ]]; then
+        stty echo
+        echo "NAV_PREV" # 這是給變數抓的結果
+        return
+      fi
+        
+      # 2. 處理 Enter 鍵
+      elif [[ "$key" == "" ]]; then 
+        stty echo
+        echo "" >&2         # [關鍵修改] 換行顯示給眼睛看 (>&2)
+        echo "$input_buffer" # 這是給變數抓的結果 (stdout)
+        return
+      # 3. 處理 Backspace (刪除鍵)
+      elif [[ "$key" == $'\x7f' || "$key" == $'\b' ]]; then
+        if [ ${#input_buffer} -gt 0 ]; then
+          input_buffer="${input_buffer::-1}"
+          echo -ne "\b \b" >&2 # [關鍵修改] 視覺刪除給眼睛看 (>&2)
+        fi
+      else
+        input_buffer+="$key"
+        echo -ne "$key" >&2 # [關鍵修改] 打字顯示給眼睛看 (>&2)
+      fi
+  done
+  stty echo
+}
+
+show_cert_status() {
+  local target_page="$1"
+  [ -z "$target_page" ] && target_page=1
+
+  local GREEN='\033[0;32m'
+  local BLUE='\033[0;34m'
+
+
+  # 環境檢查
+  check_web_environment
+  if [[ $use_my_app != true ]]; then
+    echo -e "===== 站點憑證狀態 ====="
+    echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
+    TOTAL_PAGES_NGINX=1
+    return 0
+  fi
+
+  display_width() {
+    local str="$1"; local width=0; local i=0; local len=${#str}
+    while [ $i -lt $len ]; do
+      local char="${str:$i:1}"
+      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then width=$((width + 2)); else width=$((width + 1)); fi
+            i=$((i + 1))
+    done
+    echo $width
+  }
+  pad_str() {
+    local text="$1"; local max="$2"; local align="$3"
+    local w=$(display_width "$text")
+    local pad=$((max - w)); [[ $pad -lt 0 ]] && pad=0
+    local spaces; printf -v spaces "%*s" $pad ""
+    if [[ "$align" == "right" ]]; then echo "${spaces}${text}"; else echo "${text}${spaces}"; fi
+  }
+
+  truncate_domain() {
+    local d="$1"
+    local max_len=28
+    if [ ${#d} -gt $max_len ]; then
+      local head="${d:0:5}"
+      local tail=".${d##*.}"
+      echo "${head}...${tail}"
+    else
+      echo "$d"
     fi
+  }
+  local CACHE_DIR="/tmp/site_manager_cert_cache"
+  [ ! -d "$CACHE_DIR" ] && mkdir -p "$CACHE_DIR"
+  local NGINX_MAP_CACHE="$CACHE_DIR/nginx_domain_map.cache"
+  local SSL_DATE_CACHE="$CACHE_DIR/ssl_date_info.cache"
+  local SSL_CACHE_TTL=259200
+  local nginx_conf_paths=$(detect_conf_path)
+  local current_ts=$(date +%s)
+    
+  # 1. 讀取域名映射
+  declare -A domain_map
+  local nginx_mod_time=0; [[ -d "$nginx_conf_paths" ]] && nginx_mod_time=$(stat -c %Y "$nginx_conf_paths")
+  local map_mod_time=0; [[ -f "$NGINX_MAP_CACHE" ]] && map_mod_time=$(stat -c %Y "$NGINX_MAP_CACHE")
+
+  if (( map_mod_time >= nginx_mod_time )); then
+    while IFS='|' read -r dom path; do [[ -n "$dom" ]] && domain_map["$dom"]="$path"; done < "$NGINX_MAP_CACHE"
+  else
+    > "$NGINX_MAP_CACHE"
+    local raw_configs
+    if raw_configs=$(grep -rE "server_name|ssl_certificate " "$nginx_conf_paths"/*.conf 2>/dev/null); then
+      local cur_domains=""
+      while read -r line; do
+        if [[ "$line" == *"server_name"* ]]; then
+          local tmp=${line#*server_name}; tmp=${tmp%;*}; cur_domains=$(echo "$tmp" | xargs)
+        elif [[ "$line" == *"ssl_certificate "* && -n "$cur_domains" ]]; then
+          local c_path=${line#*ssl_certificate}; c_path=${c_path%;*}; c_path=$(echo "$c_path" | xargs)
+          if [[ "$c_path" == /etc/letsencrypt/live/* ]]; then
+            for d in $cur_domains; do [[ -n "$d" ]] && domain_map["$d"]="$c_path" && echo "$d|$c_path" >> "$NGINX_MAP_CACHE"; done
+          fi
+          cur_domains=""
+        fi
+      done <<< "$raw_configs"
+    fi
+  fi
+
+  if [ ${#domain_map[@]} -eq 0 ]; then
+    echo -e "${GREEN}目前沒有偵測到任何使用 Let's Encrypt 的域名。${RESET}"
+    TOTAL_PAGES_NGINX=1; return 0
+  fi
+
+  # 2. 讀取 SSL 快取
+  declare -A ssl_cache_data
+  local cache_dirty=false
+  if [[ -f "$SSL_DATE_CACHE" ]]; then
+    while IFS='|' read -r p d n t; do ssl_cache_data["$p"]="$d|$n|$t"; done < "$SSL_DATE_CACHE"
+  fi
+
+  declare -A unique_paths
+  for d in "${!domain_map[@]}"; do unique_paths["${domain_map[$d]}"]=1; done
+
+  for path in "${!unique_paths[@]}"; do
+    if [[ ! -f "$path" ]]; then ssl_cache_data["$path"]="檔案遺失|需檢查|$current_ts"; continue; fi
+    local cached_info="${ssl_cache_data[$path]}"
+    local need_update=true
+    if [[ -n "$cached_info" ]]; then
+      IFS='|' read -r _ _ last_ts <<< "$cached_info"
+      (( (current_ts - last_ts) < SSL_CACHE_TTL )) && need_update=false
+    fi
+    if [[ "$need_update" == true ]]; then
+      local end_date="讀取失敗"; local note=""
+      local cert_out=$(openssl x509 -in "$path" -noout -enddate -issuer 2>/dev/null)
+      if [[ -n "$cert_out" ]]; then
+        local raw_date=$(echo "$cert_out" | grep 'notAfter' | cut -d= -f2)
+        [[ -n "$raw_date" ]] && end_date=$(date -d "$raw_date" +"%Y-%m-%d")
+        [[ "$cert_out" == *"CloudFlare"* ]] && note="CF 原始憑證"
+      fi
+      ssl_cache_data["$path"]="$end_date|$note|$current_ts"
+      cache_dirty=true
+    fi
+  done
+  if [[ "$cache_dirty" == true ]]; then
+    > "$SSL_DATE_CACHE"
+    for p in "${!ssl_cache_data[@]}"; do echo "$p|${ssl_cache_data[$p]}" >> "$SSL_DATE_CACHE"; done
+  fi
+
+  # 3. 準備渲染資料
+  local -a render_rows=()
+  local -a sorted_domains
+  IFS=$'\n' sorted_domains=($(sort <<<"${!domain_map[@]}"))
+  unset IFS
+
+  for domain in "${sorted_domains[@]}"; do
+    [[ -z "$domain" ]] && continue
+    local path="${domain_map[$domain]}"
+    local cert_name=$(basename "$(dirname "$path")")
+    local info="${ssl_cache_data[$path]}"
+    IFS='|' read -r e_date note _ <<< "$info"
+    local display_date="$e_date"
+    if [[ -z "$e_date" ]]; then display_date="${RED}未知${RESET}"; 
+    elif [[ "$e_date" == "檔案遺失" ]]; then display_date="${RED}檔案遺失${RESET}"; 
+    elif [[ "$e_date" == "讀取失敗" ]]; then display_date="${RED}讀取失敗${RESET}"; fi
+    render_rows+=("$domain|$display_date|$cert_name|$note")
+  done
+
+    # 4. 分頁計算
+    local total_rows=${#render_rows[@]}
+    local page_size=10
+    TOTAL_PAGES_NGINX=$(( (total_rows + page_size - 1) / page_size ))
+    [[ $TOTAL_PAGES_NGINX -eq 0 ]] && TOTAL_PAGES_NGINX=1
+    
+    if [ "$target_page" -gt "$TOTAL_PAGES_NGINX" ]; then target_page=$TOTAL_PAGES_NGINX; fi
+    if [ "$target_page" -lt 1 ]; then target_page=1; fi
+    CURRENT_PAGE_NGINX=$target_page
+
+    local start_index=$(( (target_page - 1) * page_size ))
+    local end_index=$(( start_index + page_size - 1 ))
+    if [ $end_index -ge $total_rows ]; then end_index=$(( total_rows - 1 )); fi
+
+    # 5. 渲染輸出
+    local headers=("域名" "到期日" "憑證資料夾" "備註")
+    local -a col_widths=(0 0 0 0)
+    for i in "${!headers[@]}"; do col_widths[$i]=$(display_width "${headers[$i]}"); done
+
+    local -a page_data=()
+    for ((i=start_index; i<=end_index; i++)); do
+        IFS='|' read -r d date c n <<< "${render_rows[$i]}"
+        
+        # 套用新的縮略邏輯
+        local display_d=$(truncate_domain "$d")
+        
+        local clean_date=$(echo -e "$date" | sed "s/\x1B\[[0-9;]*[a-zA-Z]//g")
+        local w_d=${#display_d}
+        local w_date=$(display_width "$clean_date")
+        local w_c=$(display_width "$c")
+        local w_n=$(display_width "$n")
+
+        [ $w_d -gt ${col_widths[0]} ] && col_widths[0]=$w_d
+        [ $w_date -gt ${col_widths[1]} ] && col_widths[1]=$w_date
+        [ $w_c -gt ${col_widths[2]} ] && col_widths[2]=$w_c
+        [ $w_n -gt ${col_widths[3]} ] && col_widths[3]=$w_n
+        
+        page_data+=("$display_d|$date|$c|$n")
+    done
 
     echo -e "===== 站點憑證狀態 ====="
-
-    local CACHE_DIR="/tmp/site_manager_cert_cache"
-    mkdir -p "$CACHE_DIR"
-    
-    local NGINX_MAP_CACHE="$CACHE_DIR/nginx_domain_map.cache" # 存: 域名|憑證路徑
-    local SSL_DATE_CACHE="$CACHE_DIR/ssl_date_info.cache" # 存: 憑證路徑|到期日|備註|更新時間戳
-    local SSL_CACHE_TTL=259200
-    local nginx_conf_paths=$(detect_conf_path)
-    local current_ts=$(date +%s)
-    declare -A domain_map
-    local nginx_mod_time=0
-    [[ -d "$nginx_conf_paths" ]] && nginx_mod_time=$(stat -c %Y "$nginx_conf_paths")
-    local map_mod_time=0
-    [[ -f "$NGINX_MAP_CACHE" ]] && map_mod_time=$(stat -c %Y "$NGINX_MAP_CACHE")
-
-    if (( map_mod_time >= nginx_mod_time )); then
-        while IFS='|' read -r dom path; do
-            [[ -n "$dom" && -n "$path" ]] && domain_map["$dom"]="$path"
-        done < "$NGINX_MAP_CACHE"
-    else
-        local server_configs
-        server_configs=$(awk '/server_name/,/ssl_certificate /' "$nginx_conf_paths"/*.conf 2>/dev/null | grep -E "server_name|ssl_certificate ")
-        
-        local cur_domains=""
-        > "$NGINX_MAP_CACHE" # 清空重建
-
-        if [[ -n "$server_configs" ]]; then
-            while IFS= read -r line; do
-                if [[ $line =~ server_name ]]; then
-                    cur_domains=$(echo "$line" | sed -e 's/server_name//' -e 's/;//' | xargs)
-                elif [[ $line =~ ssl_certificate && -n "$cur_domains" ]]; then
-                    local c_path=$(echo "$line" | awk '{print $2}' | sed 's/;//')
-                    if [[ "$c_path" == /etc/letsencrypt/live/* ]]; then
-                        for d in $cur_domains; do
-                            [[ -n "$d" ]] && domain_map["$d"]="$c_path" && echo "$d|$c_path" >> "$NGINX_MAP_CACHE"
-                        done
-                    fi
-                    cur_domains=""
-                fi
-            done <<< "$server_configs"
-        fi
-    fi
-
-    if [ ${#domain_map[@]} -eq 0 ]; then
-        echo -e "${GREEN}目前沒有偵測到任何使用 Let's Encrypt 的域名。${RESET}"
-        return 0
-    fi
-
-    declare -A ssl_cache_data
-    local cache_dirty=false
-
-    if [[ -f "$SSL_DATE_CACHE" ]]; then
-        while IFS='|' read -r p d n t; do
-            ssl_cache_data["$p"]="$d|$n|$t"
-        done < "$SSL_DATE_CACHE"
-    fi
-
-    declare -A unique_paths
-    for d in "${!domain_map[@]}"; do unique_paths["${domain_map[$d]}"]=1; done
-
-    for path in "${!unique_paths[@]}"; do
-        if [[ ! -f "$path" ]]; then
-          ssl_cache_data["$path"]="檔案遺失|需檢查|$current_ts"
-          continue
-        fi
-
-        # 檢查記憶體快取
-        local cached_info="${ssl_cache_data[$path]}"
-        local need_update=true
-
-        if [[ -n "$cached_info" ]]; then
-            IFS='|' read -r _ _ last_ts <<< "$cached_info"
-            # 檢查是否過期 (3天)
-            if (( (current_ts - last_ts) < SSL_CACHE_TTL )); then
-                need_update=false
-            fi
-        fi
-
-        if [[ "$need_update" == true ]]; then
-            local end_date="讀取失敗"
-            local note=""
-            local cert_out
-            
-            cert_out=$(openssl x509 -in "$path" -noout -enddate -issuer 2>/dev/null)
-            
-            if [[ -n "$cert_out" ]]; then
-                local raw_date=$(echo "$cert_out" | grep 'notAfter' | cut -d= -f2)
-                [[ -n "$raw_date" ]] && end_date=$(date -d "$raw_date" +"%Y-%m-%d")
-                
-                if echo "$cert_out" | grep -q "CloudFlare"; then note="CF 原始憑證"; fi
-            fi
-            
-            ssl_cache_data["$path"]="$end_date|$note|$current_ts"
-            cache_dirty=true
-        fi
-    done
-
-    if [[ "$cache_dirty" == true ]]; then
-        > "$SSL_DATE_CACHE"
-        for p in "${!ssl_cache_data[@]}"; do
-            echo "$p|${ssl_cache_data[$p]}" >> "$SSL_DATE_CACHE"
-        done
-    fi
-
-    
-    display_width() {
-        local str="$1"
-        if [[ "$str" =~ ^[[:ascii:]]*$ ]]; then
-            echo ${#str}
-        else
-            local w=0; local i=0; local len=${#str}
-            while [ $i -lt $len ]; do
-                local c="${str:$i:1}"
-                if [[ $(printf "%d" "'$c") -gt 127 ]] 2>/dev/null; then w=$((w+2)); else w=$((w+1)); fi
-                ((i++))
-            done
-            echo $w
-        fi
-    }
-
-    pad_out() {
-        local str="$1"; local max="$2"
-        local w=$(display_width "$str")
-        local pad=$((max - w))
-        printf "%s%*s" "$str" $pad ""
-    }
-
-    # 準備資料與計算寬度
-    local headers=("域名" "到期日" "憑證資料夾" "備註")
-    local -a widths=(4 6 10 4) # 預設最小值
-    local -a rows=()
-    
-    # 排序域名
-    local -a sorted_domains
-    mapfile -t sorted_domains < <(printf "%s\n" "${!domain_map[@]}" | sort)
-
-    for domain in "${sorted_domains[@]}"; do
-        [[ -z "$domain" ]] && continue
-        
-        local path="${domain_map[$domain]}"
-        local cert_name=$(basename "$(dirname "$path")")
-        local info="${ssl_cache_data[$path]}"
-        
-        IFS='|' read -r e_date note _ <<< "$info"
-        [[ -z "$e_date" ]] && e_date="${RED}未知${RESET}"
-
-        if [[ "$e_date" == "檔案遺失" ]]; then e_date="${RED}檔案遺失${RESET}"; fi
-
-        rows+=("$domain|$e_date|$cert_name|$note")
-        
-        # 更新欄寬 (只算去色後的長度)
-        local raw_vals=("$domain" "$(echo "$e_date" | sed 's/\x1b\[[0-9;]*m//g')" "$cert_name" "$note")
-        for i in {0..3}; do
-            local w=$(display_width "${raw_vals[$i]}")
-            [[ $w -gt ${widths[$i]} ]] && widths[$i]=$w
-        done
-    done
-
-    # 輸出表頭
+    local header_line=""
     for i in {0..3}; do
-        pad_out "${headers[$i]}" "${widths[$i]}"
-        [[ $i -lt 3 ]] && printf " | "
+        header_line+=$(pad_str "${headers[$i]}" "${col_widths[$i]}" "left")
+        [[ $i -lt 3 ]] && header_line+=" | "
     done
-    echo ""
+    echo -e "${BLUE}${header_line}${RESET}"
 
-    # 分隔線
-    local total_w=0
-    for w in "${widths[@]}"; do ((total_w+=w)); done
-    ((total_w+=9)) # 3個分隔符 " | " 各3字元
-    printf '%.0s-' $(seq 1 $total_w); echo ""
-
-    # 輸出內容
-    for row in "${rows[@]}"; do
-        IFS='|' read -r d e c n <<< "$row"
-        pad_out "$d" "${widths[0]}"; printf " | "
-        pad_out "$e" "${widths[1]}"; printf " | "
-        pad_out "$c" "${widths[2]}"; printf " | "
-        pad_out "$n" "${widths[3]}"; echo ""
+    for row in "${page_data[@]}"; do
+        IFS='|' read -r d date c n <<< "$row"
+        local line=""
+        line+=$(pad_str "$d" "${col_widths[0]}" "left") && line+=" | "
+        
+        local clean_date=$(echo -e "$date" | sed "s/\x1B\[[0-9;]*[a-zA-Z]//g")
+        local pad_len=$(( ${col_widths[1]} - $(display_width "$clean_date") ))
+        line+="$date"; printf -v sp "%*s" $pad_len ""; line+="$sp | "
+        
+        line+=$(pad_str "$c" "${col_widths[2]}" "left") && line+=" | "
+        line+=$(pad_str "$n" "${col_widths[3]}" "left")
+        echo -e "$line"
     done
+    
+    echo -e "${GRAY}頁碼: $CURRENT_PAGE_NGINX / $TOTAL_PAGES_NGINX${RESET}"
 }
 
 show_domain_status_caddy() (
@@ -4419,34 +4472,56 @@ show_menu_caddy(){
 
 show_menu_nginx(){
   while true; do
-    conf_file=""
-    domain=""
+    # 確保終端機回顯正常
+    stty echo
+    
     clear
-    show_cert_status
+    # 1. 顯示憑證狀態 (傳入全域頁碼)
+    show_cert_status "$CURRENT_PAGE_NGINX"
+    
+    # 2. 顯示選單
     echo "-------------------"
     echo "站點管理器"
     echo ""
     echo -e "${YELLOW}i. 安裝 Nginx / OpenResty          r. 解除安裝 Nginx / OpenResty${RESET}"
     echo ""
-    echo "1. 新增站點           2. 刪除站點"
+    echo -e "${GREEN}1.${RESET} 新增站點           ${GREEN}2.${RESET} 刪除站點"
     echo ""
-    echo "3. 申請 SSL 證書      4. 刪除 SSL 證書"
+    echo -e "${GREEN}3.${RESET} 申請 SSL 證書      ${GREEN}4.${RESET} 刪除 SSL 證書"
     echo ""
-    echo "5. 重置 DNS 憑證      6. PHP 管理"
+    echo -e "${GREEN}5.${RESET} 重置 DNS 憑證      ${GREEN}6.${RESET} PHP 管理"
     echo ""
-    echo "7. 修復Cloudflare 525錯誤    8. MYSQL安裝及管理"
+    echo -e "${GREEN}7.${RESET} 修復Cloudflare 525錯誤    ${GREEN}8.${RESET} MYSQL安裝及管理"
     echo ""
-    echo "9. Docker安裝及管理"
+    echo -e "${GREEN}9.${RESET} Docker安裝及管理"
     echo ""
-    echo "u. 更新腳本           0. 離開"
+    echo -e "${BLUE}u.${RESET} 更新腳本           ${RED}0.${RESET} 離開"
     echo "-------------------"
-    echo -n -e "\033[1;33m請選擇操作 [1-9 / i u 0]: \033[0m"
-    read -r choice
+    echo -e "${GRAY}[←/→] 翻頁  [數字] 選擇選單${RESET}"
+    echo -n -e "${YELLOW}請選擇操作 [1-9 / i u 0]: ${RESET}"
+    
+    # 3. 獲取輸入 (異步)
+    # 這邊 stdout 會拿到純淨的結果，視覺回顯走 stderr
+    choice=$(get_input_or_nav)
+    
+    # 4. 處理導航
+    if [[ "$choice" == "NAV_NEXT" ]]; then
+        if [ "$CURRENT_PAGE_NGINX" -lt "$TOTAL_PAGES_NGINX" ]; then 
+            CURRENT_PAGE_NGINX=$((CURRENT_PAGE_NGINX + 1))
+        fi
+        continue
+    elif [[ "$choice" == "NAV_PREV" ]]; then
+        if [ "$CURRENT_PAGE_NGINX" -gt 1 ]; then 
+            CURRENT_PAGE_NGINX=$((CURRENT_PAGE_NGINX - 1))
+        fi
+        continue
+    fi
+    
+    # 5. 處理業務邏輯
     case $choice in
     i)
-      check_web_environment
-      check_nginx
-      check_web_server
+      check_web_environment; check_nginx; check_web_server;
+      read -p "請按任意鍵繼續..." -n1
       ;;
     1)
       check_no_ngx || continue
@@ -4476,41 +4551,35 @@ show_menu_nginx(){
       ;;
     7)
       clean_nginx_ssl_config
+      read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
     8)
       if ! command -v dba >/dev/null 2>&1; then
         bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
       fi
-      if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then
-        dba mysql install
-      else
-        dba mysql
-      fi
+      if ! command -v mysql >/dev/null 2>&1 && ! command -v mariadb >/dev/null 2>&1; then dba mysql install; else dba mysql; fi
       ;;
     9)
       if ! command -v d >/dev/null 2>&1; then
         bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/docker/install.sh)
-      else
-        d
-      fi
+      else d; fi
       ;;
     0)
       exit 0
       ;;
     u)
-      clear
-      echo "更新腳本"
-      echo "------------------------"
-      update_script
+      clear; echo "更新腳本"; echo "------------------------"; update_script
       ;;
     r)
       uninstall_webserver
       ;;
     *)
-      echo "無效選擇。"
+      if [[ -n "$choice" ]]; then echo "無效選擇: $choice"; sleep 0.5; fi
+      ;;
     esac
   done
 }
+
 case "$1" in
   --version|-V)
     echo "站點管理器版本 $version"
@@ -4526,7 +4595,9 @@ check_webserver_install
 check_and_start_service
 check_web_server
 
-case "$1" in
+
+if [ $# -ne 0 ]; then
+  case "$1" in
   setup)
     domain="$2"
     site_type="$3"
@@ -4576,34 +4647,37 @@ case "$1" in
   api)
     if [[ "$2" == "search" && "$3" == "proxy_domain" ]]; then
       target="$4"
-      conf_file=$(detect_conf_path)/
-      if [ $caddy -eq 1 ]; then
-        find $conf_file -type f -name "*.conf" | while read -r file; do
-          if grep -qE "reverse_proxy\s+(http|https)://.*$target" "$file"; then 
-            awk -v tgt="$target" '
-            /^[^ \t\n#]/ { 
-                sub(/ \{$/, "");
-                current_domain = $1; 
+      conf_dir=$(detect_conf_path)/
+      for file in "${conf_dir}"*.conf; do
+        [ -e "$file" ] || continue
+        if [ $caddy -eq 1 ]; then
+          awk -v tgt="$target" '
+            /^[^ \t\n#]/ { sub(/ \{$/, ""); current_domain = $1; }
+            $0 ~ "reverse_proxy.*" tgt { if (current_domain != "") print current_domain; }
+          ' "$file"
+        else
+          awk -v tgt="$target" '
+            $0 ~ "server_name" { 
+                # 暫存最近一個 server_name
+                for(i=2; i<=NF; i++) {
+                    d=$i; sub(/;$/, "", d); last_domains[i]=d;
+                    count=i;
+                }
             }
-            $0 ~ "reverse_proxy.*" tgt { 
-                if (current_domain != "") print current_domain; 
+            $0 ~ "proxy_pass.*" tgt {
+                for(j=2; j<=count; j++) print last_domains[j];
             }
-            ' "$file"
-          fi
-        done | sort | uniq
-      else
-        find $conf_file -type f -name "*.conf" | while read -r file; do
-          if grep -qE "proxy_pass\\s+(http|https)://$target" "$file"; then 
-            grep -E "^\\s*server_name\\s+" "$file" | awk '{for(i=2;i<=NF;i++) print $i}' | sed 's/;$//'
-          fi
-        done | sort | uniq
-      fi
+          ' "$file"
+        fi
+      done | sort -u  # 只有最後這裡用一個 sort
     fi
     exit 0
     ;;
-esac  
+  esac
+fi
 if [ $caddy -eq 1 ]; then
   show_menu_caddy
 else
+  trap 'stty echo; exit' INT TERM
   show_menu_nginx
 fi
