@@ -26,49 +26,60 @@ https://github.com/gebu8f8/docker_sh
 違反者我將保留依法提出 DMCA 下架的權利。
 
 # 介紹
-
-這是一套純本地部署（非 Docker）的 Nginx/Caddy + SSL + WordPress 自動化建站腳本，專為 VPS 多系統環境設計，支援 **Debian / CentOS / Alpine Linux** 三大主流系統，讓你一鍵完成完整建站流程。
+這是一套Nginx/Caddy + SSL + WordPress 自動化建站腳本，專為 VPS 多系統環境設計，支援 **Debian / RHEL / Alpine** 三大主流系統，讓你一鍵完成完整建站流程。
 
 # 📌 備註
-
-我目前已將專案主力倉庫搬遷至 GitHub，原本長期維護於 GitLab（提交數已累積超過 200 次以上），目前此 GitHub 倉庫屬於新建立版本，因此提交紀錄較少屬正常情況。
-
+我目前已將專案主力倉庫搬遷至 GitHub，原本長期維護於 GitLab（提交數已累積超過 900 次以上），目前此 GitHub 倉庫屬於新建立版本，因此提交紀錄較少屬正常情況。
 🔗 原始 GitLab 倉庫：https://gitlab.com/gebu8f/sh
-
-🔗 GitHub 倉庫：https://github.com/gebu8f8/site_sh
 
 ---
 
 ## 特點亮點
 
-### ✅ 本地版非 Docker，更穩定可控
-與部分大佬的 Docker 方案不同，本專案專注於本地安裝，**無容器依賴、無封裝黑盒**，配置與系統高度整合，便於排錯與維護。
+### 主力是本地,除非不支援
+以前是以為openresty官方會更新很勤快，但現在發現：已經都有RHEL 10 、 Debian 13 了，官方本地版還沒支援！相信有些人已經等不及,我就動手寫一下代碼讓他用docker，但我用docker network 用host 保證不會經過NAT打斷效率
 
-### ✅ 跨三大主流系統自動適配
+### 跨三大主流系統自動適配
 自動偵測系統，根據環境自動採用：
 - apt（Debian/Ubuntu）
-- yum / dnf（CentOS/RHEL）
+- yum / dnf（CentOS/RHEL） 【RHEL 7和 8 完全不支援】
 - apk（Alpine）
 
-### ✅ 支援多家 CA 與 DNS / HTTP 驗證
+### 支援多家 CA 與 DNS / HTTP 驗證
+我是使用[acme.sh](https://github.com/acmesh-official/acme.sh)，原因就是追求極致輕量化和拒絕黑箱作業。但我有將預設CA ZeroSSL切換成Letsencrypt。
 - 憑證機構選擇：
   - Let's Encrypt
   - ZeroSSL
   - Google Trust Services
-- 驗證方式：
-  - Cloudflare DNS（API Token 驗證）
-  - HTTP（Webroot / nginx 模組）
+- 驗證方式（API Token 驗證）：
+  - Cloudflare DNS
+  - DNSPod.cn DNS
+  - Aliyun DNS
+- 傳統認證
+  - HTTP(webroot)
 
-### ✅ WordPress 一鍵部署 + 自動資料庫建立
+*本腳本不支持ip的HTTP認證
+
+### WordPress 一鍵部署
 - 自動建立資料庫與帳號密碼
-- 可保留語言選擇頁面（非全自動跳過）
-- Nginx 配置自動完成
+- Nginx和Caddy 配置自動完成
 
-### ✅ 全面錯誤處理與修復
-- 權限修復（避免 500 錯誤）
-- fastcgi socket 錯誤預防
-- certbot 自動續簽 + nginx reload
-- 自動開放 / 關閉 firewall（ufw / iptables / firewalld）
+### 全面錯誤處理與修復
+- 權限自動設定(完全配合SELinux)
+- 修復cloudflare 525錯誤(SSL加密問題)
+
+### PHP
+- 可以手動指定版本
+- 可升級/降級版本
+- 指定安裝php擴展
+- 設定php上傳和記憶體大小(記憶體固定1536MB 如果需要手動修改自行找php.ini)
+
+### 備份和還原
+- 動動手指就能輕易備份(如果有資料庫的話需要dba指令), **不支援自動備份,防止成功的失敗**
+- 在部屬flarum和Wordpress 會詢問是否還原備份
+
+### 防禦
+- 本腳本使用HttpGuard 開源防禦程序 能防禦CC攻擊 【有管理面板】
 
 ---
 
