@@ -1,4 +1,4 @@
-# Nginx/Caddy 全自動建站工具（支援 Certbot + WordPress）By gebu8f
+# Nginx/Caddy 全自動建站工具
 
 # 站點管理器所整合的所有腳本
 資料庫管理器：https://github.com/gebu8f8/db_sh
@@ -22,8 +22,6 @@ https://github.com/gebu8f8/docker_sh
 - **若有修改，請明確標註變更**
 - **禁止移除授權資訊後冒充原作者**
 - **不提供任何保固或技術責任**
-
-違反者我將保留依法提出 DMCA 下架的權利。
 
 # 介紹
 這是一套Nginx/Caddy + SSL + WordPress 自動化建站腳本，專為 VPS 多系統環境設計，支援 **Debian / RHEL / Alpine** 三大主流系統，讓你一鍵完成完整建站流程。
@@ -80,6 +78,15 @@ https://github.com/gebu8f8/docker_sh
 
 ### 防禦
 - 本腳本使用HttpGuard 開源防禦程序 能防禦CC攻擊 【有管理面板】
+
+## 主選單
+- 你可以看到你的域名和到期時間和證書資料夾
+- 還可以翻頁(十個域名1頁)
+- 優化效能,加入快取
+
+畫面:
+
+![site](https://img.gebu8f.com/site.jpg)
 
 ---
 
