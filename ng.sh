@@ -27,7 +27,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # 版本
-version="8.3.2"
+version="8.3.3"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -53,6 +53,7 @@ phpini_path()(
 )
 
 check_system(){
+  selinux_enforcing=false
   if command -v apt >/dev/null 2>&1; then
     system=1
   elif command -v dnf >/dev/null 2>&1; then
@@ -1418,8 +1419,8 @@ flarum_setup() {
   php flarum cache:clear
   echo "已安裝繁體與簡體中文語系，可至 Flarum 後台 Extensions 啟用。"
 
-  chown -R $ngx_user:$ngx_user "/var/www/$domain"
-  rhel_selinux_enforcing_permissions "/var/www/$domain"
+  rhel_selinux_enforcing_permissions "/var/www/$domain" label
+  rhel_selinux_enforcing_permissions "/var/www/$domain" permissions
   setup_site "$domain" flarum
   
   case $system in
@@ -1544,7 +1545,7 @@ html_sites(){
   else
     echo "<h1>歡迎來到 $domain</h1>" > /var/www/$domain/index.html
   fi
-  chown -R $ngx_user:$ngx_user /var/www/$domain
+  rhel_selinux_enforcing_permissions "/var/www/$domain" permissions
   setup_site "$domain" html
   echo "已建立 $domain 之html站點。"
 }
@@ -2812,10 +2813,30 @@ wp_change_domains() {
 
 rhel_selinux_enforcing_permissions() {
   local domain_path="$1"
-  if $selinux_enforcing; then
+  local tags="$2"
+  if $selinux_enforcing && [ "$tags" = "label" ] ; then
     semanage fcontext -d "$domain_path(/.*)?" 2>/dev/null
     semanage fcontext -a -t httpd_sys_rw_content_t "$domain_path(/.*)?"
     restorecon -Rv $domain_path >/dev/null
+  fi
+  if $selinux_enforcing && [ "$tags" = "permissions" ]; then
+    local ngx_user=$(get_web_run_user)
+    local u_id=$(id -u)
+    setfacl -R -b "$domain_path"
+    chown -R $u_id:$u_id "$domain_path"
+    chmod -R 700 "$domain_path"
+    setfacl -R -m u:$ngx_user:rwX "$domain_path"
+    setfacl -R -d -m u:$ngx_user:rwX "$domain_path"
+    if [ -f "$domain_path/wp-config.php" ]; then 
+      setfacl -m u:$ngx_user:r "$domain_path/wp-config.php"
+      [ -d "$domain_path/wp-content/mu-plugins" ] && mkdir -p "$domain_path/wp-content/mu-plugins"
+      setfacl -R -m u:$ngx_user:rX "$domain_path/wp-content/mu-plugins"
+      setfacl -R -d -m u:$ngx_user:rX "$domain_path/wp-content/mu-plugins"
+    fi
+  elif ! $selinux_enforcing && [ "$tags" = permissions ]; then
+    chown -R $ngx_user:$ngx_user "$domain_path"
+    find "$domain_path" -type d -exec chmod 755 {} +
+    find "$domain_path" -type f -exec chmod 644 {} +
   fi
 }
 
@@ -2832,13 +2853,25 @@ rhel_selinux_cleanup_permissions() {
 set_site_permissions() {
   local mode="$1"
   local dest_dir="$2"
-
+  local u_id=$(id -u)
   local ngx_user=$(get_web_run_user)
-
-  chown -R $ngx_user:$ngx_user "$dest_dir"
-
-  find "$dest_dir" -type d -exec chmod 755 {} +
-  find "$dest_dir" -type f -exec chmod 644 {} +
+  
+  if $selinux_enforcing; then
+    chown -R $u_id:$u_id "$dest_dir"
+    chmod -R 700 "$dest_dir"
+    setfacl -R -m u:$ngx_user:rwX "$dest_dir"
+    setfacl -R -d -m u:$ngx_user:rwX "$dest_dir"
+    if [ -f "$dest_dir/wp-config.php" ]; then 
+      setfacl -m u:$ngx_user:r "$dest_dir/wp-config.php"
+      [ -d "$dest_dir/wp-content/mu-plugins" ] && mkdir -p "$dest_dir/wp-content/mu-plugins"
+      setfacl -R -m u:$ngx_user:rX "$dest_dir/wp-content/mu-plugins"
+      setfacl -R -d -m u:$ngx_user:rX "$dest_dir/wp-content/mu-plugins"
+    fi
+  else
+    chown -R $ngx_user:$ngx_user "$dest_dir"
+    find "$dest_dir" -type d -exec chmod 755 {} +
+    find "$dest_dir" -type f -exec chmod 644 {} +
+  fi
   
   if $selinux_enforcing; then
     semanage fcontext -d "$dest_dir(/.*)?" 2>/dev/null
@@ -3728,8 +3761,8 @@ wordpress_site() {
       rm -f /tmp/wp_salts.txt
     fi
     # 設定權限
-    rhel_selinux_enforcing_permissions "/var/www/$domain"
-    chown -R $ngx_user:$ngx_user "/var/www/$domain"
+    rhel_selinux_enforcing_permissions "/var/www/$domain" label
+    rhel_selinux_enforcing_permissions "/var/www/$domain" permissions
   fi
   setup_site "$domain" php
   if ! is_db_done; then
@@ -4342,8 +4375,8 @@ menu_php() {
         else
           echo "<?php echo 'Hello from your PHP site!'; ?>" > "/var/www/$domain/index.php"
         fi
-        chown -R $ngx_user:$ngx_user "/var/www/$domain"
-        rhel_selinux_enforcing_permissions "/var/www/$domain"
+        rhel_selinux_enforcing_permissions "/var/www/$domain" label
+        rhel_selinux_enforcing_permissions "/var/www/$domain" permissions
         setup_site "$domain" php
         read -p "操作完成，請按任意鍵繼續..." -n1
         ;;
