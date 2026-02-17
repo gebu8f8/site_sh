@@ -2,32 +2,28 @@
 
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
-  echo "此腳本需要root權限運行" 
+  export ORIG_UID="$(id -u)"
+  export ORIG_GID="$(id -g)"
   if command -v sudo >/dev/null 2>&1; then
-    exec sudo "$0" "$@"
-  else
-    install_sudo_cmd=""
-    if command -v apt >/dev/null 2>&1; then
-      install_sudo_cmd="apt-get update && apt-get install -y sudo"
-    elif command -v dnf >/dev/null 2>&1; then
-      install_sudo_cmd="dnf install -y sudo"
-    elif command -v apk >/dev/null 2>&1; then
-      install_sudo_cmd="apk add sudo"
-    else
-      echo "無sudo指令"
-      sleep 1
-      exit 1
-    fi
-    su -c "$install_sudo_cmd"
-    if [ $? -eq 0 ] && command -v sudo >/dev/null 2>&1; then
-      echo "sudo指令已經安裝成功，請等下輸入您的密碼"
+    if sudo -n true 2>/dev/null; then
+      echo "使用免密 sudo"
       exec sudo "$0" "$@"
+    elif sudo -l >/dev/null 2>&1; then
+      echo "使用 sudo（請輸入密碼）"
+      exec sudo "$0" "$@"
+    else
+      echo "sudo 存在但無權限"
     fi
   fi
+  if command -v su >/dev/null 2>&1; then
+    echo "使用 su（請輸入 root 密碼）"
+    exec su -c "$0 $*"
+  fi
+  echo "無法取得 root 權限"
+  exit 1
 fi
-
 # 版本
-version="8.3.3"
+version="8.3.4"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -123,46 +119,43 @@ check_web_environment() {
 
 check_cert() {
   local domain="$1"
-  local acme_home="$HOME/.acme.sh"
+  local cert_base="/etc/letsencrypt/live"
   
-  # --- 第一階段：極速模式 (修正版) ---
-  if [ -d "$acme_home" ]; then
-    local wildcard_domain="*.${domain#*.}"
-    local found_conf
-    found_conf=$(grep -r -l -e "$domain" -e "$wildcard_domain" "$acme_home" --include="*.conf" 2>/dev/null | head -n 1)
+  # 參數檢查
+  [[ -z "$domain" || ! -d "$cert_base" ]] && return 1
+  if [[ -f "$cert_base/$domain/fullchain.pem" ]]; then
+    echo "$domain"
+    return 0
+  fi
+  local wildcard_domain="*.${domain#*.}"
+  local cert_path
+  local sans
+  local san_entry
+  
+  # 遍歷目錄
+  for dir in "$cert_base"/*; do
+    [[ -d "$dir" ]] || continue
+    
+    cert_path="$dir/fullchain.pem"
+    [[ -f "$cert_path" ]] || continue
 
-    if [ -n "$found_conf" ]; then
-      local le_domain
-      le_domain=$(grep "^Le_Domain=" "$found_conf" | cut -d= -f2 | tr -d "'")
-      
-      if [ -n "$le_domain" ] && [ -f "/etc/letsencrypt/live/$le_domain/fullchain.pem" ]; then
-        echo "$le_domain"
+    sans=$(openssl x509 -in "$cert_path" -noout -ext subjectAltName 2>/dev/null)
+    [[ -z "$sans" ]] && continue
+
+    sans="${sans//DNS:/}"
+    sans="${sans//,/ }"
+    
+    local san_array=($sans)
+
+    for san_entry in "${san_array[@]}"; do
+      [[ "$san_entry" == *":"* ]] && continue 
+
+      if [[ "$san_entry" == "$domain" ]] || [[ "$san_entry" == "$wildcard_domain" ]]; then
+        basename "$dir"
         return 0
       fi
-    fi
-  fi
-  
-  # --- 第二階段：相容模式 (保持不變，作為備案) ---
-  local cert_dir="/etc/letsencrypt/live"
-  [ ! -d "$cert_dir" ] && return 1
-
-  for dir in "$cert_dir"/*; do
-    [ -d "$dir" ] || continue
-    local cert_path="$dir/fullchain.pem"
-
-    if [ -f "$cert_path" ]; then
-      local san_list=$(openssl x509 -in "$cert_path" -noout -ext subjectAltName 2>/dev/null | \
-        grep -oE 'DNS:[^,]+' | sed 's/DNS://g')
-
-      for san in $san_list; do
-        if [[ "$san" == "$domain" ]] || [[ "$san" == "*.${domain#*.}" ]]; then
-          echo "$(basename "$dir")"
-          return 0
-        fi
-      done
-    fi
+    done
   done
-
   return 1
 }
 
@@ -1387,17 +1380,7 @@ flarum_setup() {
 
   # 自動申請 SSL（若不存在）
   check_cert "$domain" || {
-    echo "未偵測到 Let's Encrypt 憑證，嘗試自動申請..."
-    if ssl_apply "$domain"; then
-      echo "申請成功，重新驗證憑證..."
-      check_cert "$domain" || {
-        echo "申請成功但仍無法驗證憑證，中止建立站點"
-        return 1
-      }
-    else
-      echo "SSL 申請失敗，中止建立站點"
-      return 1
-    fi
+    ssl_apply "$domain" || return $?
   }
   local db_name="flarum_$(echo $domain | sed 's/\./_/g; s/-//g')"
   local db_user="${db_name}_user"
@@ -1524,17 +1507,7 @@ html_sites(){
   local ngx_user=$(get_web_run_user)
   read -p "請輸入網址:" domain
   check_cert "$domain" || {
-    echo "未偵測到 Let's Encrypt 憑證，嘗試自動申請..."
-    if ssl_apply "$domain"; then
-      echo "申請成功，重新驗證憑證..."
-        check_cert "$domain" || {
-          echo "申請成功但仍無法驗證憑證，中止建立站點"
-          return 1
-        }
-    else
-      echo "SSL 申請失敗，中止建立站點"
-      return 1
-    fi
+    ssl_apply "$domain" || return $?
   }
   mkdir -p /var/www/$domain
   local confirm
@@ -2453,17 +2426,7 @@ reverse_proxy(){
   target_url=${target_url:-127.0.0.1}
   target_protocol=${target_protocol:-http}
   check_cert "$domain" || {
-    echo "未偵測到 Let's Encrypt 憑證，嘗試自動申請..."
-    if ssl_apply "$domain"; then
-      echo "申請成功，重新驗證憑證..."
-        check_cert "$domain" || {
-          echo "申請成功但仍無法驗證憑證，中止建立站點"
-          return 1
-        }
-    else
-      echo "SSL 申請失敗，中止建立站點"
-      return 1
-    fi
+    ssl_apply "$domain" || return $?
   }
   setup_site "$domain" proxy "$target_url" "$target_protocol" "$target_port"
   echo "已建立 $domain 反向代理站點。"
@@ -2821,9 +2784,10 @@ rhel_selinux_enforcing_permissions() {
   fi
   if $selinux_enforcing && [ "$tags" = "permissions" ]; then
     local ngx_user=$(get_web_run_user)
-    local u_id=$(id -u)
+    local u_id="${ORIG_UID:-$(id -u)}"
+    local g_id="${ORIG_GID:-$(id -g)}"
     setfacl -R -b "$domain_path"
-    chown -R $u_id:$u_id "$domain_path"
+    chown -R $u_id:$g_id "$domain_path"
     chmod -R 700 "$domain_path"
     setfacl -R -m u:$ngx_user:rwX "$domain_path"
     setfacl -R -d -m u:$ngx_user:rwX "$domain_path"
@@ -2853,7 +2817,9 @@ rhel_selinux_cleanup_permissions() {
 set_site_permissions() {
   local mode="$1"
   local dest_dir="$2"
-  local u_id=$(id -u)
+  local u_id="${ORIG_UID:-$(id -u)}"
+  local g_id="${ORIG_GID:-$(id -g)}"
+
   local ngx_user=$(get_web_run_user)
   
   if $selinux_enforcing; then
@@ -3379,17 +3345,26 @@ show_php() {
 }
 
 ssl_apply() {
-  check_acme
-  # --- 1. 處理域名與路徑 ---
+  check_acme 
+  local acme_log="/var/log/acme_issue.log"
+  touch "$acme_log" 2>/dev/null 
+
+  local err_code
   local domains="$1"
+  
+  # --- 1. 處理域名與路徑 ---
   if [ -z "$domains" ]; then
     read -p "請輸入您的域名（只能用空白鍵分隔）：" domains
   fi
   
-  # 陣列轉換 (處理逗號或空格)
+  # 陣列轉換
   IFS=$' ,\n' read -ra domain_array <<< "$domains"
+  if [ ${#domain_array[@]} -eq 0 ]; then
+    echo -e "${RED}錯誤：未輸入任何域名${RESET}"
+    return 1
+  fi
   
-  # 找出主域名 (非泛域名優先)
+  # 找出主域名 (非泛域名優先，用於目錄命名)
   local main_domain=""
   local non_wildcard_found=0
   for d in "${domain_array[@]}"; do
@@ -3402,8 +3377,7 @@ ssl_apply() {
   # 如果全是泛域名，取第一個
   [ $non_wildcard_found -eq 0 ] && main_domain="${domain_array[0]}"
   
-  # 準備目標目錄
-  local cert_dir_name=""
+  local cert_dir_name
   if [[ "$main_domain" == "*."* ]]; then
     cert_dir_name="${main_domain#*.}"
   else
@@ -3412,13 +3386,11 @@ ssl_apply() {
   
   local target_dir="/etc/letsencrypt/live/$cert_dir_name"
 
-  # 準備 acme.sh 參數 (-d domain1 -d domain2 ...)
   local -a domain_args=()
   for d in "${domain_array[@]}"; do
     domain_args+=("-d" "$d")
   done
 
-  # --- 2. 選擇驗證方式 ---
   echo "選擇驗證方式："
   echo "1) DNS API (Cloudflare、DNSPod、Aliyun)"
   echo "2) DNS Manual (手動添加 TXT)"
@@ -3465,7 +3437,6 @@ ssl_apply() {
     *) echo -e "${RED}無效選擇${RESET}"; return 1 ;;
     esac
 
-    # 通用檢查與輸入邏輯
     if [ ! -f "$ACME_CONF" ] || ! grep -q "$check_key" "$ACME_CONF"; then
       echo
       [ -n "$extra_tip" ] && echo -e "${YELLOW}${extra_tip}${RESET}"
@@ -3474,10 +3445,13 @@ ssl_apply() {
         echo
         read -s -p "${input_prompts[$i]}： " user_input
         echo
+        # 使用 export 讓 acme.sh 讀取到環境變數
         export "${input_vars[$i]}=$user_input"
       done
     fi
-    acme.sh --issue --dns "$dns_plugin" "${domain_args[@]}" || return 1
+
+    acme.sh --issue --dns "$dns_plugin" "${domain_args[@]}" --log "$acme_log"
+    err_code=$?
     ;;
 
   2) # DNS Manual
@@ -3485,62 +3459,111 @@ ssl_apply() {
     [[ ! "$continue_choice" =~ ^[Yy]$ ]] && { echo "已取消。"; return 0; }
     
     # 第一步：獲取 TXT 記錄
-    acme.sh --issue --dns "${domain_args[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please
+    acme.sh --issue --dns "${domain_args[@]}" \
+      --yes-I-know-dns-manual-mode-enough-go-ahead-please \
+      --log "$acme_log"
     
     echo -e "\n${YELLOW}請去 DNS 後台添加上述 TXT 記錄。${RESET}"
     read -p "添加完成後，請按任意鍵繼續驗證..." -n1
     
-    # 第二步：驗證
-    acme.sh --renew "${domain_args[@]}" --yes-I-know-dns-manual-mode-enough-go-ahead-please || return 1
+    # 第二步：驗證 (renew 用於手動模式的第二步驗證)
+    acme.sh --renew "${domain_args[@]}" \
+      --yes-I-know-dns-manual-mode-enough-go-ahead-please \
+      --log "$acme_log"
+    err_code=$?
     ;;
 
   3) # HTTP
     [[ "$domains" =~ \*\. ]] && echo "HTTP驗證不支援萬用字元域名。" >&2 && return 1
     
     local detect_conf_path=$(detect_conf_path)
+    # 確保 Nginx 配置目錄存在
+    [ -z "$detect_conf_path" ] && { echo -e "${RED}無法偵測 Nginx 配置目錄${RESET}"; return 1; }
     mkdir -p /var/www/acme
+    wget -q -O "$detect_conf_path/acme.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_http.conf || { echo "下載模板失敗"; return 1; }
     
-    # 下載模板
-    wget -O "$detect_conf_path/acme.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/domain_http.conf || { echo "下載模板失敗"; return 1; }
-    
-    # 轉換陣列為空格分隔字串，確保 Nginx 語法正確
+    # 轉換陣列為空格分隔字串
     local nginx_domains="${domain_array[*]}"
     sed -i "s|domain|$nginx_domains|g" "$detect_conf_path/acme.conf"
     
-    restart_webserver
+    local restart_web=$(restart_webserver)
+    local web_err=$?
+    if [ $web_err -ne 0 ]; then
+      echo -e "${RED}重啟或檢查時發生錯誤，以下是原因${RESET}"
+      echo "$restart_web"
+      read -p "按 Enter 鍵繼續..."
+      rm -f "$detect_conf_path/acme.conf"
+      return 1
+    fi
     
-    # 執行驗證
-    acme.sh --issue "${domain_args[@]}" -w /var/www/acme
-    local ret=$? # 記錄結果
+    # 執行驗證 (加入 --log)
+    acme.sh --issue "${domain_args[@]}" -w /var/www/acme --log "$acme_log"
+    err_code=$?
     
     # 清理並恢復
     rm -f "$detect_conf_path/acme.conf"
     restart_webserver
-    
-    # 如果驗證失敗，中斷流程
-    [ $ret -ne 0 ] && return 1
     ;;
     
   *) echo "無效的選擇。" >&2; return 1 ;;
   esac
+  
+  # --- 3. 處理申請結果 ---
+  if [[ $err_code -ne 0 ]]; then
+    echo -e "${RED}SSL 申請失敗。${RESET}"
+    echo -e "詳細錯誤日誌已記錄於： ${YELLOW}$acme_log${RESET}"
+    echo -e "你可以執行： cat $acme_log 來查看詳細原因。"
+    read -p "按 Enter 鍵返回..."
+    return 1
+  fi
 
+  # --- 4. 安裝憑證 (Install Cert) ---
   mkdir -p "$target_dir"
   local reload_cmd=""
+  
+  # 判斷 reload 指令
   if [ -n "$docker_name" ]; then
     reload_cmd="docker restart $docker_name"
   else
-    # 根據 system 判斷
     case "$system" in
     1|2) reload_cmd="systemctl reload nginx || systemctl reload openresty" ;;
     3) reload_cmd="rc-service nginx reload" ;;
     esac
   fi
+  
   acme.sh --install-cert -d "$main_domain" \
     --fullchain-file "$target_dir/fullchain.pem" \
     --key-file       "$target_dir/privkey.pem" \
-    --reloadcmd      "$reload_cmd"
+    --reloadcmd      "$reload_cmd" \
+    --log "$acme_log"
 
-  echo -e "${GREEN}證書申請與安裝完成！${RESET}"
+  local acme_err_code=$?
+  if [[ $acme_err_code -ne 0 ]]; then
+    echo -e "${RED}SSL 安裝 (Install-Cert) 失敗${RESET}"
+    echo -e "請查看日誌：$acme_log"
+    read -p "按 Enter 鍵繼續..."
+    return 2
+  else
+    if [[ -f "$target_dir/privkey.pem" && -f "$target_dir/fullchain.pem" ]]; then
+      echo -e "${GREEN}證書申請與安裝完成！${RESET}"
+    else
+      echo -e "${RED}錯誤：目錄 $target_dir 未找到憑證檔案，可能是權限問題。${RESET}"
+      sleep 1.5
+      return 3
+    fi
+  fi
+  local res=$(check_cert "$main_domain")
+  local err_ch=$?
+  
+  if [ $err_ch -eq 0 ]; then
+    echo -e "${GREEN}系統驗證成功，檢測到網域憑證：$res${RESET}"
+    rm -rf $acme_log
+    return 0
+  else
+    echo -e "${RED}系統驗證失敗：check_cert 無法讀取到新憑證${RESET}"
+    echo "Error Code: $err_ch"
+    return 4
+  fi
 }
 
 toggle_httpguard_module() {
@@ -3715,20 +3738,9 @@ wordpress_site() {
 
   # 自動申請 SSL（若不存在）
   check_cert "$domain" || {
-    echo "未偵測到 Let Encrypt 憑證，嘗試自動申請..."
-    if ssl_apply "$domain"; then
-      echo "申請成功，重新驗證憑證..."
-        check_cert "$domain" || {
-          echo "申請成功但仍無法驗證憑證，中止建立站點"
-          return 1
-        }
-    else
-      echo "SSL 申請失敗，中止建立站點"
-      return 1
-    fi
+    ssl_apply "$domain" || return $?
   }
 
-  
   read -p "是否還原現有的wp文件？(Y/N): " restore_file
   restore_file=${restore_file,,}
   if [[ $restore_file == "y" || $restore_file == "" ]]; then
@@ -4355,17 +4367,7 @@ menu_php() {
         local ngx_user=$(get_web_run_user)
         read -p "請輸入您的域名：" domain
         check_cert "$domain" || {
-          echo "未偵測到 Let's Encrypt 憑證，嘗試自動申請..."
-          if ssl_apply "$domain"; then
-            echo "申請成功，重新驗證憑證..."
-              check_cert "$domain" || {
-                echo "申請成功但仍無法驗證憑證，中止建立站點"
-                return 1
-              }
-          else
-            echo "SSL 申請失敗，中止建立站點"
-            return 1
-          fi
+          ssl_apply "$domain" || return $?
         }
         mkdir -p /var/www/$domain
         read -p "是否自訂index.php文件(Y/n)?" confirm
@@ -4654,19 +4656,8 @@ if [ $# -ne 0 ]; then
         
         # 自動申請 SSL（若不存在）
         check_cert "$domain" || {
-          echo "未偵測到 Let Encrypt 憑證，嘗試自動申請..."
-          if ssl_apply "$domain"; then
-            echo "申請成功，重新驗證憑證..."
-            check_cert "$domain" || {
-              echo "申請成功但仍無法驗證憑證，中止建立站點"
-              return 1
-            }
-          else
-              echo "SSL 申請失敗，中止建立站點"
-              return 1
-          fi
+          ssl_apply "$domain" || return $?
         }
-
         setup_site "$domain" proxy "$target_url" "$target_proto" "$target_port"
         exit 0
         ;;
