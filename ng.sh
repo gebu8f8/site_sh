@@ -1,9 +1,9 @@
 #!/bin/bash
 
+export ORIG_UID="$(id -u)"
+export ORIG_GID="$(id -g)"
 # 檢查是否以root權限運行
 if [ "$(id -u)" -ne 0 ]; then
-  export ORIG_UID="$(id -u)"
-  export ORIG_GID="$(id -g)"
   if command -v sudo >/dev/null 2>&1; then
     if sudo -n true 2>/dev/null; then
       echo "使用免密 sudo"
@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.3.4"
+version="8.3.5"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -60,6 +60,8 @@ check_system(){
     if command -v getenforce >/dev/null 2>&1; then
       if [ "$(getenforce)" == "Enforcing" ]; then
         selinux_enforcing=true
+      else
+        selinux_enforcing=false
       fi
     fi
     system=2
@@ -525,7 +527,7 @@ check_http3_support() {
 }
 
 check_nginx(){
-  check_web_environment
+  [[ -z "$use_my_app" ]] && check_web_environment
   if [[ $use_my_app = false && $port_in_use = true ]]; then
     echo -e "${RED}偵測到您的系統已安裝其他 Web Server，或 80/443 端口已被佔用。${RESET}"
     echo -e "${YELLOW}請手動停止或解除安裝相關服務，例如 apache、Caddy 或其他佔用程式。${RESET}"
@@ -638,7 +640,7 @@ chown_set(){
 }
 
 check_no_ngx(){
-  check_web_environment
+  [[ -z "$use_my_app" ]] && check_web_environment
   if [[ $use_my_app != true ]]; then
     echo -e "${RED}您好,您現在使用其他web server 無法使用此功能${RESET}"
     read -p "操作完成,請按任意鍵..." -n1
@@ -1033,6 +1035,7 @@ default(){
     restart_webserver
     ;;
   esac
+  check_web_environment
 }
 
 detect_conf_path() {
@@ -1525,28 +1528,36 @@ html_sites(){
 httpguard_setup() {
   [ "$caddy" -eq 1 ] && return 0
   check_php
-  
-  local guard_dir_host="/etc/nginx/HttpGuard" # 統一宿主機路徑
   local guard_dir_container=""
+  local guard_dir_host=""
   local ngx_conf=$(detect_nginx_conf_paths)
+  local ngx_user=$(get_web_run_user)
   
-  # --- 1. 環境檢測與路徑設定 ---
-  if [ -n "$docker_name" ]; then
-    guard_dir_container="/usr/local/openresty/nginx/conf/HttpGuard"
-  else
-    case $system in
-      1|2)
-        [ ! -x "$(command -v openresty)" ] && { echo "未偵測到 openresty"; return 1; }
+  if [[ -z "$docker_name" && ( -n "$openresty" || -n "$nginx" ) ]]; then
+    if [ "$openresty" -eq 1 ]; then
+      if ! openresty -V 2>&1 | grep -qi lua; then
+        echo -e "${RED}未找到lua套件 無法安裝${RESET}"
+        sleep 1.5
+        return 1
+      else
         guard_dir_host="/usr/local/openresty/nginx/conf/HttpGuard"
         guard_dir_container="/usr/local/openresty/nginx/conf/HttpGuard"
-        ;;
-      3)
-        [ ! -x "$(command -v nginx)" ] && { echo "未偵測到 nginx"; return 1; }
+      fi
+    elif [ "$nginx" -eq 1 ]; then
+      if ! nginx -V 2>&1 | grep -qi lua; then
+        echo -e "${RED}未找到lua套件 無法安裝${RESET}"
+        sleep 1.5
+        return 1
+      else
+        guard_dir_host="/etc/nginx/HttpGuard"
         guard_dir_container="/etc/nginx/HttpGuard"
-        ;;
-    esac
+      fi
+    fi
+  elif [[ -n "$docker_name" && ( -n "$openresty" || -n "$nginx" ) ]]; then
+    guard_dir_host="/etc/nginx/HttpGuard"
+    guard_dir_container="/usr/local/openresty/nginx/conf/HttpGuard"
   fi
-
+  
   if [ -f "$guard_dir_host/config.lua" ]; then
     menu_httpguard; return 0
   fi
@@ -1557,7 +1568,6 @@ httpguard_setup() {
   wget -qO "$tmp_zip" https://files.gebu8f.com/site/HttpGuard.zip || return 1
   unzip -qo "$tmp_zip" -d "$tmp_dir"
 
-  # 判斷裡面有沒有多一層 HttpGuard 目錄，有的話就平鋪移動
   rm -rf "$guard_dir_host"
   if [ -d "$tmp_dir/HttpGuard" ]; then
     mv "$tmp_dir/HttpGuard" "$guard_dir_host"
@@ -1605,8 +1615,28 @@ EOF
 
   sed -i "/http {/r $tmp_block" "$ngx_conf"
   rm -f "$tmp_block"
-
-  # --- 5. 重啟與測試 ---
+  
+  if $selinux_enforcing; then
+    setfacl -R -b "$guard_dir_host"
+    chown -R 0:0 "$guard_dir_host"
+    find "$guard_dir_host" -type d -exec chmod 700 {} +
+    find "$guard_dir_host" -type f -exec chmod 600 {} +
+    find "$guard_dir_host" -type d -exec setfacl -m u:$ngx_user:r-x {} +
+    find "$guard_dir_host" -type f -exec setfacl -m u:$ngx_user:r-- {} +
+    setfacl -R -d -m u:$ngx_user:rX "$guard_dir_host"
+    # logs 
+    setfacl -R -b "$guard_dir_host/logs"
+    setfacl -m u:$ngx_user:wx "$guard_dir_host/logs"
+    find "$guard_dir_host/logs" -type f -exec setfacl -m u:$ngx_user:w- {} +
+    setfacl -d -m u:$ngx_user:w "$guard_dir_host/logs"
+    semanage fcontext -a -t httpd_log_t "$guard_dir_host/logs(/.*)?"
+    restorecon -Rv "$guard_dir_host/logs"
+  else
+    chown -R $ngx_user:$ngx_user "$guard_dir_host"
+    find "$guard_dir_host" -type d -exec chmod 700 {} +
+    find "$guard_dir_host" -type f -exec chmod 600 {} +
+  fi
+  
   if restart_webserver; then
     echo "HttpGuard 安裝完成"
     menu_httpguard
@@ -3029,7 +3059,7 @@ show_cert_status() {
 
 
   # 環境檢查
-  check_web_environment
+  [[ -z "$use_my_app" ]] && check_web_environment
   if [[ $use_my_app != true ]]; then
     echo -e "===== 站點憑證狀態 ====="
     echo -e "${RED}您好,您現在使用其他 web server 無法使用站點憑證狀態之功能${RESET}"
@@ -4168,15 +4198,15 @@ menu_wp(){
   detect_sites WordPress
   echo "-------------------"
   echo "WordPress管理"
-  echo -e "${YELLOW}1. 部署WordPress站點${RESET}"
+  echo -e "${YELLOW}1. 部署WordPress站點     2. 安裝wp-cli ${RESET}"
   echo ""
-  echo "2. 安裝插件         3. 移除插件"
+  echo "3. 安裝插件         4. 移除插件"
   echo ""
-  echo "4. 部署主題         5. 移除主題"
+  echo "5. 部署主題         6. 移除主題"
   echo ""
-  echo "6. 修改管理員帳號   7. 修改管理員密碼"
+  echo "7. 修改管理員帳號   8. 修改管理員密碼"
   echo ""
-  echo -e "${YELLOW}8. 修復網站崩潰（禁用所有插件和恢復預設主題，慎用）${RESET}"
+  echo -e "${YELLOW}9. 修復網站崩潰（禁用所有插件和恢復預設主題，慎用）${RESET}"
   echo ""
   echo "0. 返回"
   echo -n -e "\033[1;33m請選擇操作 [0-10]: \033[0m"
@@ -4189,42 +4219,50 @@ menu_wp(){
       wordpress_site
       ;;
     2)
+      if command -v wp >/dev/null 2>&1; then
+        echo -e "${GREEN}您已成功安裝，不需重複安裝${RESET}"
+        sleep 1.5
+      else
+        install_wpcli_if_needed
+      fi
+      ;;
+    3)
       install_wpcli_if_needed
       local domain=$(detect_sites_menu WordPress)
       install_wp_plugin_with_search_or_url $domain
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
-    3)
+    4)
       install_wpcli_if_needed
       local domain=$(detect_sites_menu WordPress)
       remove_wp_plugin_with_menu $domain
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
-    4)
+    5)
       install_wpcli_if_needed
       local domain=$(detect_sites_menu WordPress)
       deploy_or_remove_theme  install $domain
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
-    5)
+    6)
       install_wpcli_if_needed
       local domain=$(detect_sites_menu WordPress)
       deploy_or_remove_theme  remove $domain
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
-    6)
+    7)
       install_wpcli_if_needed
       local domain=$(detect_sites_menu WordPress)
       change_wp_admin_username $domain
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
-    7)
+    8)
       install_wpcli_if_needed
       local domain=$(detect_sites_menu WordPress)
       change_wp_admin_password $domain
       read -p "操作完成，請按任意鍵繼續..." -n1
       ;;
-    8)
+    9)
       install_wpcli_if_needed
       local domain=$(detect_sites_menu WordPress)
       reset_wp_site $domain
@@ -4534,7 +4572,7 @@ show_menu_nginx(){
     echo "-------------------"
     echo -e "${GRAY}[←/→] 翻頁  [數字] 選擇選單${RESET}"
     echo -n -e "${YELLOW}請選擇操作 [1-9 / i u 0]: ${RESET}"
-    
+
     # 3. 獲取輸入 (異步)
     # 這邊 stdout 會拿到純淨的結果，視覺回顯走 stderr
     choice=$(get_input_or_nav)
@@ -4625,11 +4663,10 @@ esac
 # 只有不是 --version 或 -V 才會執行以下初始化
 check_system
 check_app
+check_web_server
 check_web_environment
 check_webserver_install
 check_and_start_service
-check_web_server
-
 
 if [ $# -ne 0 ]; then
   case "$1" in
