@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.3.5"
+version="8.3.6"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -1587,10 +1587,35 @@ httpguard_setup() {
     ss_cmd=$(command -v ss 2>/dev/null || echo "/usr/sbin/ss")
   fi
   sed -i "s|ssCommand *= *\"[^\"]*\"|ssCommand = \"$ss_cmd\"|" "$guard_dir_host/config.lua"
+  
+  
+  if $selinux_enforcing; then
+    setfacl -R -b "$guard_dir_host"
+    chown -R 0:0 "$guard_dir_host"
+    chmod 700 "$guard_dir_host"
+    find "$guard_dir_host" -type d -exec chmod 700 {} +
+    find "$guard_dir_host" -type f -exec chmod 600 {} +
+    setfacl -R -d -m u:$ngx_user:rX "$guard_dir_host"
+    setfacl -R -m u:$ngx_user:rX "$guard_dir_host"
+    # logs 
+    setfacl -R -b "$guard_dir_host/logs"
+    setfacl -m u:$ngx_user:wX "$guard_dir_host/logs"
+    setfacl -d -m u:$ngx_user:w "$guard_dir_host/logs"
+    semanage fcontext -a -t httpd_log_t "$guard_dir_host/logs(/.*)?"
+    restorecon -Rv "$guard_dir_host/logs"
+  else
+    chown -R $ngx_user:$ngx_user "$guard_dir_host"
+    find "$guard_dir_host" -type d -exec chmod 700 {} +
+    find "$guard_dir_host" -type f -exec chmod 600 {} +
+  fi
+  
 
   echo "正在生成驗證碼圖檔..."
   (cd "$guard_dir_host/captcha" && php getImg.php)
-  chown -R nginx:nginx "$guard_dir_host"
+  
+  if ! $selinux_enforcing; then
+    chown -R $ngx_user:$ngx_user "$guard_dir_host"
+  fi
 
   # --- 4. 緊湊插入配置到 nginx.conf (關鍵修正) ---
   echo "正在注入配置到 $ngx_conf..."
@@ -1615,28 +1640,6 @@ EOF
 
   sed -i "/http {/r $tmp_block" "$ngx_conf"
   rm -f "$tmp_block"
-  
-  if $selinux_enforcing; then
-    setfacl -R -b "$guard_dir_host"
-    chown -R 0:0 "$guard_dir_host"
-    find "$guard_dir_host" -type d -exec chmod 700 {} +
-    find "$guard_dir_host" -type f -exec chmod 600 {} +
-    find "$guard_dir_host" -type d -exec setfacl -m u:$ngx_user:r-x {} +
-    find "$guard_dir_host" -type f -exec setfacl -m u:$ngx_user:r-- {} +
-    setfacl -R -d -m u:$ngx_user:rX "$guard_dir_host"
-    # logs 
-    setfacl -R -b "$guard_dir_host/logs"
-    setfacl -m u:$ngx_user:wx "$guard_dir_host/logs"
-    find "$guard_dir_host/logs" -type f -exec setfacl -m u:$ngx_user:w- {} +
-    setfacl -d -m u:$ngx_user:w "$guard_dir_host/logs"
-    semanage fcontext -a -t httpd_log_t "$guard_dir_host/logs(/.*)?"
-    restorecon -Rv "$guard_dir_host/logs"
-  else
-    chown -R $ngx_user:$ngx_user "$guard_dir_host"
-    find "$guard_dir_host" -type d -exec chmod 700 {} +
-    find "$guard_dir_host" -type f -exec chmod 600 {} +
-  fi
-  
   if restart_webserver; then
     echo "HttpGuard 安裝完成"
     menu_httpguard
@@ -2807,7 +2810,7 @@ wp_change_domains() {
 rhel_selinux_enforcing_permissions() {
   local domain_path="$1"
   local tags="$2"
-  if $selinux_enforcing && [ "$tags" = "label" ] ; then
+  if $selinux_enforcing && [ "$tags" = "label" ]; then
     semanage fcontext -d "$domain_path(/.*)?" 2>/dev/null
     semanage fcontext -a -t httpd_sys_rw_content_t "$domain_path(/.*)?"
     restorecon -Rv $domain_path >/dev/null
@@ -2818,7 +2821,9 @@ rhel_selinux_enforcing_permissions() {
     local g_id="${ORIG_GID:-$(id -g)}"
     setfacl -R -b "$domain_path"
     chown -R $u_id:$g_id "$domain_path"
-    chmod -R 700 "$domain_path"
+    chmod 700 "$domain_path"
+    find "$domain_path" -type d -exec chmod 700 {} +
+    find "$domain_path" -type f -exec chmod 600 {} +
     setfacl -R -m u:$ngx_user:rwX "$domain_path"
     setfacl -R -d -m u:$ngx_user:rwX "$domain_path"
     if [ -f "$domain_path/wp-config.php" ]; then 
@@ -2826,6 +2831,11 @@ rhel_selinux_enforcing_permissions() {
       [ -d "$domain_path/wp-content/mu-plugins" ] && mkdir -p "$domain_path/wp-content/mu-plugins"
       setfacl -R -m u:$ngx_user:rX "$domain_path/wp-content/mu-plugins"
       setfacl -R -d -m u:$ngx_user:rX "$domain_path/wp-content/mu-plugins"
+      if [ -d "$domain_path/wp-content/mu-plugins" ]; then
+        semanage fcontext -d "$domain_path/wp-content/mu-plugins(/.*)?" 2>/dev/null
+        semanage fcontext -a -t httpd_sys_content_t "$domain_path/wp-content/mu-plugins(/.*)?"
+        restorecon -Rv "$domain_path/wp-content/mu-plugins" >/dev/null
+      fi
     fi
   elif ! $selinux_enforcing && [ "$tags" = permissions ]; then
     chown -R $ngx_user:$ngx_user "$domain_path"
