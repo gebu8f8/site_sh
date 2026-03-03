@@ -1,13 +1,5 @@
 # Nginx/Caddy 全自動建站工具
 
-# 站點管理器所整合的所有腳本
-資料庫管理器：https://github.com/gebu8f8/db_sh
-
-防火牆管理器：https://github.com/gebu8f8/firewall_sh
-
-Docker管理器：
-https://github.com/gebu8f8/docker_sh
-
 # 注意 !
 - 本腳本採取選擇性設計原則：  
 - 僅加入經過測試、穩定、必要的功能。  
@@ -90,10 +82,9 @@ https://github.com/gebu8f8/docker_sh
 
 ---
 
-## 初次運行時需要下方指令,接下來可用site呼叫
 
 ## 安裝與使用
 ```
 bash <(curl -sL https://sh.gebu8f.com/site)
 ```
-之後即可用site使用之
+*後續可用site命令開啟*
