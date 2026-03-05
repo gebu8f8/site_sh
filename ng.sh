@@ -23,11 +23,13 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.3.6"
+version="8.3.7"
 
 #變量
 CURRENT_PAGE_NGINX=1
 TOTAL_PAGES_NGINX=1
+_GLOBAL_NGINX_CONF_CACHE=""
+_GLOBAL_VHOST_PATH_CACHE=""
 
 # 顏色定義
 RED="\033[1;31m"    # ❌ 錯誤用紅色
@@ -38,7 +40,8 @@ GRAY='\033[0;90m'
 RESET='\033[0m'      # 清除顏色
 
 phpini_path()(
-  local php_var=$(check_php_version)
+  local php_var
+  php_var=$(check_php_version) || exit 1
   local php_ini
   if [ "$system" -eq 1 ]; then
     php_ini="/etc/php/$php_var/fpm/php.ini"
@@ -317,33 +320,85 @@ check_web_server() {
 }
 
 detect_nginx_conf_paths(){
+  if [[ -n "$_GLOBAL_NGINX_CONF_CACHE" ]]; then
+    if [[ -f "$_GLOBAL_NGINX_CONF_CACHE" ]]; then
+      echo "$_GLOBAL_NGINX_CONF_CACHE"
+      return 0
+    else
+      # 如果快取有值但檔案找不到（可能被刪除或容器掛載改變），清空快取重新檢測
+      _GLOBAL_NGINX_CONF_CACHE=""
+    fi
+  fi
+
   local cmd_bin=""
   local conf_path=""
-
-  # --- Docker 模式 ---
-  if [ -n "$docker_name" ]; then
-    # 判斷容器內的 binary 名稱 (OpenResty 容器內通常也是叫 openresty 或 nginx)
-    if [ "$openresty" -eq 1 ]; then
-      cmd_bin="openresty"
-    elif [ "$nginx" -eq 1 ]; then
-      cmd_bin="nginx"
-    fi
-    
-    # 執行 docker exec 取回 config 路徑
-    # 注意：這裡拿到的是【容器內路徑】，如果你要編輯，需要確保你的腳本知道對應的 Host 路徑
-    conf_path="/etc/nginx/nginx.conf"
-
-  # --- Host 模式 ---
+  
+  # 判斷 Binary 名稱 (共用邏輯)
+  if [ "$openresty" -eq 1 ]; then
+    cmd_bin="openresty"
+  elif [ "$nginx" -eq 1 ]; then
+    cmd_bin="nginx"
   else
-    if [ "$openresty" -eq 1 ]; then
-      cmd_bin="openresty"
-    elif [ "$nginx" -eq 1 ]; then
-      cmd_bin="nginx"
+    # 預設 fallback，避免變數未定義導致錯誤
+    cmd_bin="nginx"
+  fi
+
+  # --- 2. Docker 模式 (動態獲取並映射路徑) ---
+  if [[ -n "$docker_name" ]]; then
+    
+    # A. 進入容器內部獲取「容器內部的絕對路徑」
+    # 使用 docker exec 執行 -t 測試命令並抓取路徑
+    local internal_path
+    internal_path=$(docker exec "$docker_name" "$cmd_bin" -t 2>&1 | sed -n 's#.*configuration file \([^ ]*\.conf\).*#\1#p' | head -n1)
+    
+    # 如果拿不到內部路徑，直接返回空並結束
+    if [[ -z "$internal_path" ]]; then
+      echo "Error: 無法在 Docker 容器 '$docker_name' 內檢測到 Nginx 設定檔路徑。" >&2
+      exit 1
     fi
+
+    # B. 將「容器內部路徑」轉換為「宿主機路徑」
+    # 使用 docker inspect 獲取所有掛載點 (Mounts)，格式: Source:Destination
+    local mounts
+    mounts=$(docker inspect -f '{{ range .Mounts }}{{ .Source }}:{{ .Destination }} {{ end }}' "$docker_name")
+    
+    # 遍歷掛載點進行比對
+    for mount in $mounts; do
+      local src="${mount%%:*}"   # 宿主機路徑 (Source)
+      local dst="${mount#*:}"    # 容器內路徑 (Destination)
+      
+      # 情況 1: 直接掛載檔案 (例如 -v /host/nginx.conf:/etc/nginx/nginx.conf)
+      if [[ "$internal_path" == "$dst" ]]; then
+        conf_path="$src"
+        break
+      fi
+      
+      # 情況 2: 掛載目錄 (例如 -v /host/nginx:/etc/nginx)，配置在子目錄中
+      # 判斷 internal_path 是否以 dst 開頭 (且 dst 結尾要有 / 或是完全匹配目錄結構)
+      if [[ "$internal_path" == "$dst/"* ]]; then
+        # 字串替換：把 internal_path 前面的 dst 換成 src
+        conf_path="${internal_path/$dst/$src}"
+        break
+      fi
+    done
+    if [[ -z "$conf_path" ]]; then
+      echo "Error: 找到容器內設定檔 '$internal_path'，但該路徑未掛載到宿主機，無法編輯。" >&2
+      exit 1
+    fi
+  # --- 3. Host 模式 ---
+  else
     conf_path=$($cmd_bin -t 2>&1 | sed -n 's#.*configuration file \([^ ]*\.conf\).*#\1#p' | head -n1)
   fi
 
-  echo "$conf_path"
+  # --- 4. 寫入快取並輸出 ---
+  if [[ -n "$conf_path" && -f "$conf_path" ]]; then
+    _GLOBAL_NGINX_CONF_CACHE="$conf_path"
+    echo "$conf_path"
+    return 0
+  else
+    echo "Error: 無法找到有效的 Nginx 設定檔 (檢測結果: $conf_path)。" >&2
+    exit 1
+  fi
 }
 # WordPress備份
 # 回傳 wp/flarum/unknown
@@ -417,7 +472,8 @@ backup_site_type() {
 }
 
 backup_site() {
-  local conf_dir=$(detect_conf_path)
+  local conf_dir
+  conf_dir=$(detect_conf_path) || exit $?
   # 取得所有 .conf
   local raw_files=("$conf_dir"/*.conf)
   local site_files=()
@@ -969,7 +1025,8 @@ change_wp_admin_password() {
 
 
 clean_nginx_ssl_config() {
-  conf_path=$(detect_conf_path)
+  local conf_path
+  conf_path=$(detect_conf_path) || exit $?
 
   # 遍歷所有 conf 檔
   find "$conf_path" -type f -name "*.conf" | while read -r file; do
@@ -988,8 +1045,10 @@ clean_nginx_ssl_config() {
 
 default(){
   local mode=$1
-  local detect_conf_path=$(detect_conf_path)
-  local ngx_conf=$(detect_nginx_conf_paths)
+  local ngx_conf_path
+  ngx_conf_path=$(detect_conf_path) || exit $?
+  local ngx_conf
+  ngx_conf=$(detect_nginx_conf_paths) || exit $?
   create_directories
   generate_ssl_cert
   if [[ "$docker_name" == "openresty" || "$docker_name" == "nginx" ]]; then
@@ -1001,25 +1060,25 @@ default(){
     3)  id -u nginx &>/dev/null || (addgroup -g 1689 nginx && adduser -u 1689 -G nginx -D -H -s /sbin/nologin nginx) ;;
     esac
     wget -qO $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
-    wget -qO $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+    wget -qO $ngx_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     sed -i 's|include /etc/nginx/conf.d/\*.conf;|include /usr/local/openresty/nginx/conf/conf.d/*.conf;|' "$ngx_conf"
     return 0
   fi
   case "$system" in
   1|2)
     if [ $mode == openresty ]; then
-      rm -f $ngx_conf
-      wget -O $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
+      rm -f "$ngx_conf"
+      wget -O "$ngx_conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
       id -u nginx &>/dev/null || useradd -r -s /sbin/nologin -M nginx
-      wget -O $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+      wget -O "$ngx_conf_path/default.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     fi
     if [ $mode == caddy ]; then
       rm -f /etc/caddy/Caddyfile
       wget -O /etc/caddy/Caddyfile https://gitlab.com/gebu8f/sh/-/raw/main/nginx/caddy/Caddyfile
       mkdir -p /etc/caddy/conf.d
     else
-      rm -f $detect_conf_path/default.conf $detect_conf_path/default
-      wget -O $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+      rm -f "$ngx_conf_path/default.conf" "$ngx_conf_path/default"
+      wget -O "$ngx_conf_path/default.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     fi
     restart_webserver
     ;;
@@ -1028,10 +1087,10 @@ default(){
       id -u nginx &>/dev/null || adduser -D -H -s /sbin/nologin nginx
     fi
     # download default
-    rm -f $detect_conf_path/default.conf
-    rm -f $ngx_conf
-    wget -O $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
-    wget -O $detect_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
+    rm -f "$ngx_conf_path/default.conf"
+    rm -f "$ngx_conf"
+    wget -O "$ngx_conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
+    wget -O "$ngx_conf_path/default.conf" https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     restart_webserver
     ;;
   esac
@@ -1039,32 +1098,84 @@ default(){
 }
 
 detect_conf_path() {
-  if [ -n "$docker_name" ]; then
-  
-    local docker_host_vhost_path="/etc/nginx/conf.d"
-    
-    # 確保這個目錄在宿主機上存在，如果不存在就建立它
-    mkdir -p "$docker_host_vhost_path"
-    
-    # 直接回傳此固定路徑，並結束函數，不再執行後面的 Host 檢測邏輯
-    echo "$docker_host_vhost_path"
-    return 0
+  # --- 1. 快取機制 ---
+  if [[ -n "$_GLOBAL_VHOST_PATH_CACHE" ]]; then
+    # 檢查路徑是否存在 (如果是目錄)
+    if [[ -d "$_GLOBAL_VHOST_PATH_CACHE" ]]; then
+      echo "$_GLOBAL_VHOST_PATH_CACHE"
+      return 0
+    else
+      _GLOBAL_VHOST_PATH_CACHE=""
+    fi
   fi
 
-  # --- 以下為 Host 原生環境處理 (維持你原本的邏輯不變) ---
-  
+  # --- 2. Docker 模式處理 (獨立邏輯，嚴格隔離) ---
+  if [[ -n "$docker_name" ]]; then
+    
+    # A. 取得宿主機上的主設定檔路徑 (依賴上一個函式)
+    local host_main_conf
+    host_main_conf=$(detect_nginx_conf_paths) || exit 1
+
+    # B. 讀取設定檔內容，尋找 include 路徑
+    # 注意：這裡讀到的是「容器內部的路徑結構」
+    # 尋找類似 include /etc/nginx/conf.d/*.conf; 的行
+    local search_regex='^[[:space:]]*include[[:space:]]+([^;]*\*[^;]*);'
+    local container_include_path
+    container_include_path=$(sed -E -n "s/${search_regex}/\1/p" "$host_main_conf" | head -n 1)
+    
+    # 如果找不到 include 行，Docker 模式下我們不嘗試注入，直接失敗 (安全性考量)
+    if [[ -z "$container_include_path" ]]; then
+      echo "Error: 在 Docker 的主設定檔中找不到 'include' 語句 (例如 include /etc/nginx/conf.d/*.conf;)。" >&2
+      echo "由於是 Docker 模式，腳本不會自動修改主設定檔，請手動添加 include。" >&2
+      exit 1
+    fi
+
+    # 取得容器內的目錄路徑 (去掉 *.conf)
+    local container_dir
+    container_dir=$(dirname "$container_include_path")
+    
+    # C. 將「容器內目錄」映射回「宿主機目錄」
+    local host_vhost_dir=""
+    local mounts
+    mounts=$(docker inspect -f '{{ range .Mounts }}{{ .Source }}:{{ .Destination }} {{ end }}' "$docker_name")
+
+    for mount in $mounts; do
+      local src="${mount%%:*}"   # 宿主機路徑
+      local dst="${mount#*:}"    # 容器內路徑
+
+      # 情況 1: 完全匹配 (例如掛載了 conf.d 目錄)
+      if [[ "$container_dir" == "$dst" ]]; then
+        host_vhost_dir="$src"
+        break
+      fi
+      
+      # 情況 2: 子目錄匹配 (例如掛載了 /etc/nginx，而目標是 /etc/nginx/conf.d)
+      if [[ "$container_dir" == "$dst/"* ]]; then
+        # 把 container_dir 前面的 dst 部分替換成 src
+        host_vhost_dir="${container_dir/$dst/$src}"
+        break
+      fi
+    done
+
+    # D. 最終判定
+    if [[ -n "$host_vhost_dir" && -d "$host_vhost_dir" ]]; then
+      # 成功找到宿主機對應目錄
+      _GLOBAL_VHOST_PATH_CACHE="$host_vhost_dir"
+      echo "$host_vhost_dir"
+      return 0
+    else
+      echo "Error: 容器內的 Vhost 目錄 '$container_dir' 沒有掛載到宿主機，無法寫入配置。" >&2
+      exit 1
+    fi
+    
+    # 這裡 return 1 後，函式結束，絕對不會執行下方的 Host 邏輯
+  fi
   local conf=""
   local default_conf_dir=""
   
-  if command -v openresty >/dev/null 2>&1 || command -v nginx >/dev/null 2>&1; then
-    # 在 Host 模式下，呼叫 detect_nginx_conf_paths 來取得主設定檔路徑
-    conf=$(detect_nginx_conf_paths)
-  elif command -v caddy >/dev/null 2>&1; then
-    conf="/etc/caddy/Caddyfile"
-  fi
-
-  # Caddy 的處理邏輯 (不變)
+  # Caddy 邏輯
   if command -v caddy >/dev/null 2>&1; then
+    conf="/etc/caddy/Caddyfile"
     local import_line
     import_line=$(grep -E '^[[:space:]]*import[[:space:]]+/' "$conf" | grep '\*' | head -n 1)
 
@@ -1072,45 +1183,54 @@ detect_conf_path() {
       local path
       path=$(echo "$import_line" | sed -E 's/^[[:space:]]*import[[:space:]]+([^*]+)\*.*/\1/')
       path="${path%/}"
-
       echo "$path"
       return 0
     fi
-
+    
     default_conf_dir="/etc/caddy/conf.d"
     mkdir -p "$default_conf_dir"
-    echo "" >> "$conf"
-    echo "import ${default_conf_dir}/*" >> "$conf"
-    restart_webserver
+    # 注入配置
+    if ! grep -q "import ${default_conf_dir}/*" "$conf"; then
+        echo "" >> "$conf"
+        echo "import ${default_conf_dir}/*" >> "$conf"
+        restart_webserver
+    fi
     echo "$default_conf_dir"
     return 0
   fi
 
-  # Nginx / OpenResty 在 Host 上的處理邏輯 (不變)
+  # Nginx / OpenResty Host 邏輯
+  if command -v openresty >/dev/null 2>&1 || command -v nginx >/dev/null 2>&1; then
+    conf=$(detect_nginx_conf_paths)
+  fi
+
+  if [[ -z "$conf" ]]; then 
+    echo "找不到網站配置文件。">&2
+    exit 1
+  fi
+
+  # 尋找現有的 include
   local search_regex='^[[:space:]]*include[[:space:]]+([^;]*\*[^;]*);'
-  # 從主設定檔中尋找 include xxx/*.conf; 這樣的行
   local included_path=$(sed -E -n "s/${search_regex}/\1/p" "$conf" | head -n 1)
 
   if [[ -n "$included_path" ]]; then
     local target_dir
     target_dir=$(dirname "$included_path")
     mkdir -p "$target_dir"
+    _GLOBAL_VHOST_PATH_CACHE="$target_dir"
     echo "$target_dir"
     return 0
   fi
 
-  # 如果在主設定檔中找不到 include，則使用預設路徑
   if command -v openresty >/dev/null 2>&1; then
-    # OpenResty 的預設路徑
     default_conf_dir="/usr/local/openresty/nginx/conf/conf.d"
   else
-    # Nginx 的預設路徑
     default_conf_dir="/etc/nginx/conf.d"
   fi
 
   mkdir -p "$default_conf_dir"
 
-  # 檢查主設定檔是否已經包含了這個預設目錄，如果沒有就自動加上
+  # 注入 include 到 http {} 區塊
   if ! grep -qE "include[[:space:]]+${default_conf_dir}/\*\.conf;" "$conf"; then
     sed -i "/^http[[:space:]]*{/,/^}/ {
       /^}/i\\    include ${default_conf_dir}/*.conf;
@@ -1119,6 +1239,7 @@ detect_conf_path() {
     restart_webserver
   fi
 
+  _GLOBAL_VHOST_PATH_CACHE="$default_conf_dir"
   echo "$default_conf_dir"
   return 0
 }
@@ -2907,8 +3028,8 @@ set_site_permissions() {
 setup_site_http2(){
   local domain=$1
   local http3=$(check_http3_support) # 這裡會呼叫上面修好的函數
-  
-  local conf_file=$(detect_conf_path)/$domain.conf 
+  local conf_file
+  conf_file=$(detect_conf_path)/$domain.conf
   
   if [[ "$http3" != "true" ]]; then
     local ngx_ver=""
@@ -4289,12 +4410,7 @@ menu_restore_site() {
   
   # === 步驟 1: 從 Nginx 設定檔選擇域名 (邏輯內聯) ===
   local conf_dir
-  conf_dir=$(detect_conf_path)
-  if [ $? -ne 0 ]; then # 假設 detect_conf_path 失敗會回傳非 0
-      echo -e "${RED}無法偵測到 Nginx 設定檔目錄。${RESET}" >&2
-      sleep 1
-      return 1
-  fi
+  conf_dir=$(detect_conf_path) || exit $?
 
   # 使用 mapfile 結合 find 來安全地處理檔名和過濾
   mapfile -t site_files < <(find "$conf_dir" -maxdepth 1 -type f -name "*.conf" -exec bash -c 'name=$(basename "$0" .conf); [[ "$name" == *.* ]]' {} \; -print)
