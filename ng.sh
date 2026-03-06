@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.3.7"
+version="8.3.8"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -1469,8 +1469,10 @@ flarum_setup() {
   local php_var=$(check_php_version)
   local supported_php_versions=$(check_flarum_supported_php)
   local max_supported_php=$(echo "$supported_php_versions" | tr ' ' '\n' | sort -V | tail -n1)
-  local ngx_user=$(get_web_run_user)
-  local php_ini=$(phpini_path)
+  local ngx_user
+  ngx_user=$(get_web_run_user) || exit $?
+  local php_ini
+  php_ini=$(phpini_path) || exit $?
 
   # 判斷 PHP 是否高於支援版本
   if [ "$(printf '%s\n' "$php_var" "$max_supported_php" | sort -V | tail -n1)" != "$php_var" ]; then
@@ -1597,38 +1599,59 @@ generate_ssl_cert(){
 }
 
 get_web_run_user() {
-  # --- 1. 偵測 Nginx ---
-  local nginx_conf=$(detect_nginx_conf_paths)
-
-  if [ -n "$nginx_conf" ]; then
-    # 讀取 user 行，抓第一個 user 名稱，去掉分號
-    local user
-    user=$(grep -E '^\s*user\s+' "$nginx_conf" | head -1 | awk '{print $2}' | sed 's/;//')
+  local user=""
+  if [[ $openresty -eq 1 || $nginx -eq 1 ]]; then
+    local nginx_conf
+    nginx_conf=$(detect_nginx_conf_paths) || exit $?
+    if [ -n "$nginx_conf" ] && [ -f "$nginx_conf" ]; then
+      user=$(grep -E '^\s*user\s+' "$nginx_conf" | head -1 | awk '{print $2}' | sed 's/;//')
+    fi
+    if [ -z "$user" ]; then
+      local pids
+      pids=$(ss -ltnp 2>/dev/null | grep -E ':(80|443)' | grep -E 'users:' | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
+      if [ -n "$pids" ]; then
+        for p in $pids; do
+          local p_user
+          p_user=$(ps -o user= -p "$p" 2>/dev/null)
+          if [[ -n "$p_user" && "$p_user" != "root" ]]; then
+            user="$p_user"
+            break
+          fi
+        done
+        if [ -z "$user" ]; then
+          local first_pid=$(echo "$pids" | head -n1)
+          user=$(ps -o user= -p "$first_pid" 2>/dev/null)
+        fi
+      fi
+    fi
     if [ -z "$user" ]; then
       user="nobody"
     fi
+
     echo "$user"
     return 0
   fi
 
-  # --- 2. 偵測 Caddy ---
-  local pid=$(ss -ltnp 2>/dev/null | awk '/:(80|443)/ && /users:/{gsub(/.*pid=/,""); gsub(/,.*$/,""); print $NF; exit}')
+  if [[ $caddy -eq 1 ]]; then
+    local pid
+    pid=$(ss -ltnp 2>/dev/null | awk '/:(80|443)/ && /users:/{gsub(/.*pid=/,""); gsub(/,.*$/,""); print $NF; exit}')
     
-  if [ -n "$pid" ]; then
-    local user
-    user=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status")
-    if [ -n "$user" ]; then
-      user=$(getent passwd "$user" | cut -d: -f1)
-      echo "$user"
-    else
-      return 1
+    if [ -n "$pid" ]; then
+      user=$(ps -o user= -p "$pid" 2>/dev/null)
+      if [ -n "$user" ]; then
+        echo "$user"
+        return 0
+      fi
     fi
-    return 0
+    exit 1
   fi
+
+  exit 2
 }
 
 html_sites(){
-  local ngx_user=$(get_web_run_user)
+  local ngx_user
+  ngx_user=$(get_web_run_user) || exit $?
   read -p "請輸入網址:" domain
   check_cert "$domain" || {
     ssl_apply "$domain" || return $?
@@ -1652,7 +1675,8 @@ httpguard_setup() {
   local guard_dir_container=""
   local guard_dir_host=""
   local ngx_conf=$(detect_nginx_conf_paths)
-  local ngx_user=$(get_web_run_user)
+  local ngx_user
+  ngx_user=$(get_web_run_user) || exit $?
   
   if [[ -z "$docker_name" && ( -n "$openresty" || -n "$nginx" ) ]]; then
     if [ "$openresty" -eq 1 ]; then
@@ -2249,8 +2273,10 @@ php_install() {
 
 
 php_fix(){
-  local php_var=$(check_php_version)
-  local ngx_user=$(get_web_run_user)
+  local php_var
+  php_var=$(check_php_version) || exit $?
+  local ngx_user
+  ngx_user=$(get_web_run_user) || exit $?
 
   if [ $system -eq 1 ]; then  # Debian/Ubuntu
     sed -i -r "s|^;?(user\s*=\s*).*|\1$ngx_user|" /etc/php/$php_var/fpm/pool.d/www.conf
@@ -2937,7 +2963,8 @@ rhel_selinux_enforcing_permissions() {
     restorecon -Rv $domain_path >/dev/null
   fi
   if $selinux_enforcing && [ "$tags" = "permissions" ]; then
-    local ngx_user=$(get_web_run_user)
+    local ngx_user
+    ngx_user=$(get_web_run_user) || exit $?
     local u_id="${ORIG_UID:-$(id -u)}"
     local g_id="${ORIG_GID:-$(id -g)}"
     setfacl -R -b "$domain_path"
@@ -2980,8 +3007,8 @@ set_site_permissions() {
   local dest_dir="$2"
   local u_id="${ORIG_UID:-$(id -u)}"
   local g_id="${ORIG_GID:-$(id -g)}"
-
-  local ngx_user=$(get_web_run_user)
+  local ngx_user
+  ngx_user=$(get_web_run_user) || exit $?
   
   if $selinux_enforcing; then
     chown -R $u_id:$u_id "$dest_dir"
@@ -3880,7 +3907,8 @@ uninstall_webserver(){
 wordpress_site() {
   trap 'rm -f /tmp/wordpress.zip; rm -rf /tmp/wordpress' EXIT
   local MY_IP=$(curl -s https://api64.ipify.org)
-  local ngx_user=$(get_web_run_user)
+  local ngx_user
+  ngx_user=$(get_web_run_user) || exit $?
 
   if ! curl -s --connect-timeout 3 https://wordpress.org >/dev/null; then
     echo "您的IP地址不支持訪問 WordPress。"
@@ -4528,7 +4556,8 @@ menu_php() {
       3)
         clear
         check_php
-        local ngx_user=$(get_web_run_user)
+        local ngx_user
+        ngx_user=$(get_web_run_user) || exit $?
         read -p "請輸入您的域名：" domain
         check_cert "$domain" || {
           ssl_apply "$domain" || return $?
