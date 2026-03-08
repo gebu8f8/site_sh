@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.3.8"
+version="8.3.9"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -39,17 +39,22 @@ CYAN="\033[1;36m"    # ℹ️ 一般提示用青色
 GRAY='\033[0;90m'
 RESET='\033[0m'      # 清除顏色
 
-phpini_path()(
-  local php_var
-  php_var=$(check_php_version) || exit 1
-  local php_ini
-  if [ "$system" -eq 1 ]; then
-    php_ini="/etc/php/$php_var/fpm/php.ini"
-  else
-    php_ini=$(php -i | grep "Loaded Configuration File" | awk '{print $5}')
+phpini_path(){
+  if command -v php >/dev/null 2>&1; then
+    local php_ini
+    if [ "$system" -eq 1 ]; then
+      local php_var
+      php_var=$(check_php_version) || exit 1 #顯示php版本
+      php_ini=$(php-fpm$php_var -i | awk -F'=> ' '/Loaded Configuration File/{print $2}')
+    else
+      php_ini=$(php -i | grep "Loaded Configuration File" | awk '{print $5}')
+    fi
+    echo $php_ini
+    return 0
   fi
-  echo $php_ini
-)
+  return 1
+}
+
 
 check_system(){
   selinux_enforcing=false
@@ -705,36 +710,17 @@ check_no_ngx(){
 }
 
 check_php_version() {
-  case "$system" in
-    1)
-      if command -v php >/dev/null 2>&1; then
-        phpver=$(php -v | head -n1 | grep -oP '\d+\.\d+')
-        echo "$phpver" 
-      else
-        echo -e "${RED}PHP 尚未安裝。${RESET}" >&2
-        return 1
-      fi
-      ;;
-    2) 
-      if command -v php >/dev/null 2>&1; then
-        phpver=$(php -v | head -n1 | grep -oP '\d+\.\d+')
-        echo "$phpver" # ex 8.3
-      else
-        echo -e "${RED}PHP 尚未安裝。${RESET}" >&2
-        return 1
-      fi
-      ;;
-    3)
-      if command -v php >/dev/null 2>&1; then
-        local rawver=$(php -v | head -n1 | grep -oE '[0-9]+\.[0-9]+')  # 使用 -E（延伸正規表示式）
-        alpver=$(echo "$rawver" | tr -d '.')
-        echo "$alpver" #出現83
-      else
-        echo -e "${RED}PHP 尚未安裝。${RESET}" >&2
-        return 1
-      fi
-      ;;
-  esac
+  local phpver
+  if command -v php >/dev/null 2>&1; then
+    phpver=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+    if [ $system -eq 3 ]; then
+      phpver=${phpver//./}
+    fi
+    echo "$phpver" 
+  else
+    echo -e "${RED}PHP 尚未安裝。${RESET}" >&2
+    return 1
+  fi
 }
 
 check_php_ext_available() {
@@ -1599,54 +1585,40 @@ generate_ssl_cert(){
 }
 
 get_web_run_user() {
-  local user=""
-  if [[ $openresty -eq 1 || $nginx -eq 1 ]]; then
+  local user
+
+  # --- 1. Nginx / OpenResty ---
+  if [[ "$nginx" = "1"|| "$openresty" = "1" ]]; then
+
     local nginx_conf
     nginx_conf=$(detect_nginx_conf_paths) || exit $?
-    if [ -n "$nginx_conf" ] && [ -f "$nginx_conf" ]; then
-      user=$(grep -E '^\s*user\s+' "$nginx_conf" | head -1 | awk '{print $2}' | sed 's/;//')
-    fi
-    if [ -z "$user" ]; then
-      local pids
-      pids=$(ss -ltnp 2>/dev/null | grep -E ':(80|443)' | grep -E 'users:' | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
-      if [ -n "$pids" ]; then
-        for p in $pids; do
-          local p_user
-          p_user=$(ps -o user= -p "$p" 2>/dev/null)
-          if [[ -n "$p_user" && "$p_user" != "root" ]]; then
-            user="$p_user"
-            break
-          fi
-        done
-        if [ -z "$user" ]; then
-          local first_pid=$(echo "$pids" | head -n1)
-          user=$(ps -o user= -p "$first_pid" 2>/dev/null)
-        fi
-      fi
-    fi
-    if [ -z "$user" ]; then
-      user="nobody"
+
+    if [[ -f "$nginx_conf" ]]; then
+      user=$(grep -E '^\s*user\s+' "$nginx_conf" | head -1)
+      user=${user#*user}
+      user=${user%%;*}
+      user=${user%% *}
     fi
 
+    # 若 nginx.conf 沒設定 user
+    if [ -z "$user" ]; then
+      user=$(ps -eo uid,user,args | awk '$1!=0 && $3 ~ /nginx|openresty/ {print $2; exit}')
+      if [ -z "$user" ]; then
+        user=$(ps -eo uid,user,args | awk '$1==0 && $3 ~ /nginx|openresty/ {print $2; exit}')
+      fi
+      [ -n "$user" ] && echo "$user" && return 0
+    fi
+  fi
+
+
+  # --- 2. Caddy ---
+  if [ "$caddy" = "1" ]; then
+    user=$(ps -eo uid,user,args | awk '$1!=0 && /caddy/ {print $2; exit}')
+    [ -z "$user" ] && user=caddy
     echo "$user"
-    return 0
   fi
 
-  if [[ $caddy -eq 1 ]]; then
-    local pid
-    pid=$(ss -ltnp 2>/dev/null | awk '/:(80|443)/ && /users:/{gsub(/.*pid=/,""); gsub(/,.*$/,""); print $NF; exit}')
-    
-    if [ -n "$pid" ]; then
-      user=$(ps -o user= -p "$pid" 2>/dev/null)
-      if [ -n "$user" ]; then
-        echo "$user"
-        return 0
-      fi
-    fi
-    exit 1
-  fi
-
-  exit 2
+  exit 1
 }
 
 html_sites(){
@@ -2117,7 +2089,7 @@ php_install() {
       local DEB_VER=$(cat /etc/debian_version | cut -d. -f1)
       local codename=$(lsb_release -sc)
       apt update
-      apt install -y software-properties-common ca-certificates lsb-release gnupg curl
+      apt install -y ca-certificates lsb-release gnupg curl
       
       if [[ $os == "kali" ]]; then
         # Kali rolling 沒有對應的 Sury 名稱，強制指定為 bookworm
@@ -2128,6 +2100,7 @@ php_install() {
         curl -fsSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /etc/apt/trusted.gpg.d/ondrej_php.gpg
         echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list
       elif [[ $os == "ubuntu" ]]; then
+        apt install -y software-properties-common
         add-apt-repository -y ppa:ondrej/php
       fi
 
