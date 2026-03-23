@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.3.9"
+version="8.4.0"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -3880,8 +3880,9 @@ uninstall_webserver(){
 wordpress_site() {
   trap 'rm -f /tmp/wordpress.zip; rm -rf /tmp/wordpress' EXIT
   local MY_IP=$(curl -s https://api64.ipify.org)
-  local ngx_user
+  local ngx_user restore_file import_sql domain
   ngx_user=$(get_web_run_user) || exit $?
+  local wp_config="/var/www/$domain/wp-config.php"
 
   if ! curl -s --connect-timeout 3 https://wordpress.org >/dev/null; then
     echo "您的IP地址不支持訪問 WordPress。"
@@ -3918,20 +3919,20 @@ wordpress_site() {
     local db_pass=$(dba mysql add $db_name $db_user false)
 
     # 設定 wp-config.php
-    cp "/var/www/$domain/wp-config-sample.php" "/var/www/$domain/wp-config.php"
-    sed -i "s/database_name_here/$db_name/" "/var/www/$domain/wp-config.php"
-    sed -i "s/username_here/$db_user/" "/var/www/$domain/wp-config.php"
-    sed -i "s/password_here/$db_pass/" "/var/www/$domain/wp-config.php"
-    sed -i "s/localhost/localhost/" "/var/www/$domain/wp-config.php"
+    cp "/var/www/$domain/wp-config-sample.php" "$wp_config"
+    sed -i "s/database_name_here/$db_name/" "$wp_config"
+    sed -i "s/username_here/$db_user/" "$wp_config"
+    sed -i "s/password_here/$db_pass/" "$wp_config"
+    sed -i "s/localhost/localhost/" "$wp_config"
     # 安全金鑰
     if command -v wp >/dev/null 2>&1; then
       wp config shuffle-salts --path="/var/www/$domain" --allow-root
     else
       curl -s https://api.wordpress.org/secret-key/1.1/salt/ > /tmp/wp_salts.txt
-      sed -i "/define.*'AUTH_KEY'/i WP_SALTS" "/var/www/$domain/wp-config.php"
-      sed -i "/put your unique phrase here/d" "/var/www/$domain/wp-config.php"
-      sed -i "/WP_SALTS/r /tmp/wp_salts.txt" "/var/www/$domain/wp-config.php"
-      sed -i "/WP_SALTS/d" "/var/www/$domain/wp-config.php"
+      sed -i "/define.*'AUTH_KEY'/i WP_SALTS" "$wp_config"
+      sed -i "/put your unique phrase here/d" "$wp_config"
+      sed -i "/WP_SALTS/r /tmp/wp_salts.txt" "$wp_config"
+      sed -i "/WP_SALTS/d" "$wp_config"
       rm -f /tmp/wp_salts.txt
     fi
     # 設定權限
@@ -3939,7 +3940,7 @@ wordpress_site() {
     rhel_selinux_enforcing_permissions "/var/www/$domain" permissions
   fi
   setup_site "$domain" php
-  if ! is_db_done; then
+  if ! $is_db_done; then
     read -p "是否要導入現有 SQL 資料？(Y/N): " import_sql
     import_sql=${import_sql,,}
     if [[ $import_sql == "y" || $import_sql == "" ]]; then
@@ -3949,7 +3950,22 @@ wordpress_site() {
   else
     unset is_db_done
   fi
-  echo "WordPress 網站 $domain 建立完成！請瀏覽 https://$domain。"
+  # 檢查是否已存在
+  if ! grep -q "define\s*(\s*'FS_METHOD'\s*,\s*'direct'\s*)" "$wp_config"; then
+
+    # 找到目標行（模糊匹配 add any custom）
+    line=$(grep -n -i "add any custom" "$wp_config" | cut -d: -f1 | head -n1)
+
+    if [ -n "$line" ]; then
+      insert_line=$((line + 1))
+      sed -i "${insert_line}i define('FS_METHOD', 'direct');" "$wp_config"
+    else
+      echo "找不到插入位置"
+      sleep 1.5
+      return 1
+    fi
+  fi
+  echo -e "${GREEN}WordPress 網站 $domain 建立完成！請瀏覽 https://$domain。${RESET}"
 }
 
 
