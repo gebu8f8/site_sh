@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.4.0"
+version="8.4.1"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -1866,22 +1866,24 @@ install_web_server(){
       docker_name=openresty
       default $mode
       mkdir -p /etc/nginx/conf.d
-      mkdir -p /var/log/openresty
+      mkdir -p /var/log/openresty/other
+      touch /var/log/openresty/access.log
+      touch /var/log/openresty/error.log
       docker run -d \
         --name openresty \
         --restart always \
         --network host \
         -v /etc/letsencrypt:/etc/letsencrypt:ro \
-        -v /etc/nginx/conf.d:/usr/local/openresty/nginx/conf/conf.d:ro \
-        -v /etc/nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro \
+        -v /etc/nginx/conf.d:/usr/local/openresty/nginx/conf/conf.d:ro,Z \
+        -v /etc/nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro,Z \
         -v /var/www:/var/www \
         -v /run/php:/run/php:ro \
-        -v /home/web/cert:/home/web/cert:ro \
-        -v /etc/nginx/HttpGuard:/usr/local/openresty/nginx/conf/HttpGuard \
-        -v /var/log/openresty/access.log:/usr/local/openresty/nginx/logs/access.log \
-        -v /var/log/openresty/error.log:/usr/local/openresty/nginx/logs/error.log \
+        -v /home/web/cert:/home/web/cert:ro,Z \
+        -v /etc/nginx/HttpGuard:/usr/local/openresty/nginx/conf/HttpGuard:Z \
+        -v /var/log/openresty:/usr/local/openresty/nginx/logs \
         -v /etc/localtime:/etc/localtime:ro \
         gebu8f/openresty:latest
+      sleep 2.5
       check_web_server
       return 0
     fi
