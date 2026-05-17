@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.4.2"
+version="8.4.5"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -304,20 +304,27 @@ check_web_server() {
   nginx=0
   caddy=0
   docker_name=""
+
+  # 1. 先檢查本機實體環境 (Native)
   command -v openresty >/dev/null 2>&1 && openresty=1
   command -v nginx    >/dev/null 2>&1 && nginx=1
   command -v caddy    >/dev/null 2>&1 && caddy=1
   
+  # 2. 檢查 Docker 環境 (API 模式)
   if [ -S /var/run/docker.sock ]; then
-    local containers
-    containers=$(docker ps --format '{{.Names}}')
-    if [[ "$containers" =~ "openresty" ]]; then
+    # 這裡我們一次抓取所有正在運行的容器名稱，並用空白分隔
+    local running_containers
+    running_containers=$(curl -s --unix-socket /var/run/docker.sock http://localhost/containers/json \
+      | grep -oP '"Names":\["/\K[^"]+' | tr '\n' ' ')
+
+    # 使用正則匹配，確保精確度
+    if [[ " $running_containers " =~ " openresty " ]]; then
       openresty=1
       docker_name="openresty"
-    elif [[ "$containers" =~ "nginx" ]]; then
+    elif [[ " $running_containers " =~ " nginx " ]]; then
       nginx=1
       docker_name="nginx"
-    elif [[ "$containers" =~ "caddy" ]]; then
+    elif [[ " $running_containers " =~ " caddy " ]]; then
       caddy=1
       docker_name="caddy"
     fi
@@ -431,7 +438,7 @@ backup_site_type() {
 
   # --- 資料庫備份 (DB Backup) ---
   local db_name=""
-  local dba_export_dir="/root/mysql_backups"
+  local dba_export_dir="/opt/out_database/mysql"
 
   if [[ "$type" == "wp" ]]; then
     local wp_config="$web_root/wp-config.php"
@@ -680,7 +687,6 @@ check_flarum_supported_php() {
 create_directories() {
   [ $caddy -eq 1 ] && return 0
   mkdir -p /home/web/cert
-  mkdir -p /etc/nginx/conf.d/
   mkdir -p /var/www
 }
 chown_set(){
@@ -1032,24 +1038,32 @@ clean_nginx_ssl_config() {
 default(){
   local mode=$1
   local ngx_conf_path
-  ngx_conf_path=$(detect_conf_path) || exit $?
   local ngx_conf
-  ngx_conf=$(detect_nginx_conf_paths) || exit $?
   create_directories
   generate_ssl_cert
   if [[ "$docker_name" == "openresty" || "$docker_name" == "nginx" ]]; then
-    mkdir -p /var/log/openresty/logs
+    ngx_conf="/etc/nginx/nginx.conf"
+    ngx_conf_path="/etc/nginx/conf.d"
+    mkdir -p /etc/nginx/conf.d/
+    mkdir -p /var/log/openresty/other
     touch /var/log/openresty/error.log
     touch /var/log/openresty/access.log
     case $system in
     1|2)  id -u nginx &>/dev/null || (groupadd -g 1689 nginx && useradd -u 1689 -g 1689 -s /sbin/nologin -M nginx) ;;
     3)  id -u nginx &>/dev/null || (addgroup -g 1689 nginx && adduser -u 1689 -G nginx -D -H -s /sbin/nologin nginx) ;;
     esac
+    if $selinux_enforcing; then
+      semanage fcontext -a -t httpd_config_t "/etc/nginx/conf.d(/.*)?"
+      semanage fcontext -m -t httpd_config_t  "/etc/nginx/conf.d(/.*)?"
+      restorecon -Rv /etc/nginx/conf.d
+    fi
     wget -qO $ngx_conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/nginx.conf
     wget -qO $ngx_conf_path/default.conf https://gitlab.com/gebu8f/sh/-/raw/main/nginx/default_system
     sed -i 's|include /etc/nginx/conf.d/\*.conf;|include /usr/local/openresty/nginx/conf/conf.d/*.conf;|' "$ngx_conf"
     return 0
   fi
+  ngx_conf_path=$(detect_conf_path) || exit $?
+  ngx_conf=$(detect_nginx_conf_paths) || exit $?
   case "$system" in
   1|2)
     if [ $mode == openresty ]; then
@@ -1865,22 +1879,13 @@ install_web_server(){
       openresty=1
       docker_name=openresty
       default $mode
-      mkdir -p /etc/nginx/conf.d
-      mkdir -p /var/log/openresty/other
-      touch /var/log/openresty/access.log
-      touch /var/log/openresty/error.log
-      if $selinux_enforcing; then
-        semanage fcontext -a -t httpd_config_t "/etc/nginx/conf.d(/.*)?"
-        semanage fcontext -m -t httpd_config_t  "/etc/nginx/conf.d(/.*)?"
-        restorecon -Rv /etc/nginx/conf.d
-      fi
-      docker run -d \
+      docker run --init -d \
         --name openresty \
         --restart always \
         --network host \
         -v /etc/letsencrypt:/etc/letsencrypt:ro \
         -v /etc/nginx/conf.d:/usr/local/openresty/nginx/conf/conf.d:ro \
-        -v /etc/nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf: ro\
+        -v /etc/nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro\
         -v /var/www:/var/www \
         -v /run/php:/run/php:ro \
         -v /home/web/cert:/home/web/cert:ro \
@@ -1888,7 +1893,7 @@ install_web_server(){
         -v /var/log/openresty:/usr/local/openresty/nginx/logs \
         -v /etc/localtime:/etc/localtime:ro \
         gebu8f/openresty:latest
-      sleep 2.5
+      sleep 5
       check_web_server
       return 0
     fi
@@ -2829,8 +2834,11 @@ restore_site_db() {
   local db_user=""
   local db_pass=""
   local sql_to_restore=""
+  local search_dir="$site_path"
+  local from_site_root=false
+  local backup_sql_dir="/opt/out_database/mysql"
 
-  # --- 步驟 1: 從設定檔讀取資料庫憑證 (不變) ---
+  # --- 步驟 1: 從設定檔讀取資料庫憑證 ---
   if [[ "$type" == "wp" ]]; then
     local config="$site_path/wp-config.php"
     db_name=$(awk -F"'" '/DB_NAME/{print $4}' "$config")
@@ -2848,73 +2856,87 @@ restore_site_db() {
     return 1
   fi
 
-  # 確保 dba 工具存在
   if ! command -v dba >/dev/null 2>&1; then
     bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/db/dba.sh) install_script
   fi
 
-  # --- 步驟 2: 智慧地尋找並讓使用者選擇 SQL 檔案 (核心修改) ---
-  local search_dir="$site_path"
-  mapfile -t sql_files < <(find "$search_dir" -maxdepth 1 -type f -name "*.sql" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
-  
-  # 如果在網站根目錄找不到，則詢問使用者
+  # --- 步驟 2: 搜尋 SQL 檔案 ---
+  mapfile -t sql_files < <(
+    find "$search_dir" -maxdepth 1 -type f -name "*.sql" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-
+  )
+
   if [ ${#sql_files[@]} -eq 0 ] || [[ ! -f "${sql_files[0]}" ]]; then
     echo -e "${YELLOW}在網站根目錄 '$site_path' 中未找到 .sql 檔案。${RESET}"
-    local default_sql_dir="/root/mysql_backups"
-    read -p "請輸入 .sql 檔案所在的目錄 [預設: $default_sql_dir]: " search_dir
-    search_dir="${search_dir:-$default_sql_dir}"
+    read -p "請輸入 .sql 檔案所在的目錄 [預設: $backup_sql_dir]: " search_dir
+    search_dir="${search_dir:-$backup_sql_dir}"
 
     if [[ ! -d "$search_dir" ]]; then
-        echo -e "${RED}目錄不存在: $search_dir${RESET}" >&2
-        return 1
+      echo -e "${RED}目錄不存在: $search_dir${RESET}" >&2
+      return 1
     fi
-    # 重新在使用者指定的目錄中搜尋
-    mapfile -t sql_files < <(find "$search_dir" -maxdepth 1 -type f -name "*.sql" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
+
+    mapfile -t sql_files < <(
+      find "$search_dir" -maxdepth 1 -type f -name "*.sql" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-
+    )
+  else
+    from_site_root=true
   fi
 
-  # 檢查最終是否找到檔案
   if [ ${#sql_files[@]} -eq 0 ] || [[ ! -f "${sql_files[0]}" ]]; then
     echo -e "${RED}錯誤：在 '$search_dir' 目錄中仍然找不到任何 .sql 檔案。${RESET}" >&2
     return 1
   fi
 
-  # 讓使用者從找到的檔案列表中選擇
   if [ ${#sql_files[@]} -gt 1 ]; then
     echo -e "${CYAN}在 '$search_dir' 中找到以下 SQL 檔案：${RESET}"
     for i in "${!sql_files[@]}"; do
       printf "%3d) %s\n" "$((i + 1))" "$(basename "${sql_files[$i]}")"
     done
-    read -p "請選擇要還原的檔案編號: " choice
 
+    read -p "請選擇要還原的檔案編號: " choice
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#sql_files[@]} )); then
       echo -e "${RED}無效的選擇。${RESET}" >&2
       return 1
     fi
+
     sql_to_restore="${sql_files[$((choice - 1))]}"
   else
-    # 如果只有一個檔案，就自動選擇，無需使用者操作
     sql_to_restore="${sql_files[0]}"
   fi
-  
-  # --- 步驟 3: 果斷執行還原 ---
 
+  # --- 步驟 3: 如果是網站根目錄的 SQL，就先複製到 /opt/out_database/mysql ---
+  if $from_site_root; then
+    mkdir -p "$backup_sql_dir" || return 1
+    local copied_sql="$backup_sql_dir/$(basename "$sql_to_restore")"
+    cp -f -- "$sql_to_restore" "$copied_sql" || {
+      echo -e "${RED}複製 SQL 檔案失敗。${RESET}" >&2
+      return 1
+    }
+    sql_to_restore="$copied_sql"
+  fi
+
+  # --- 步驟 4: 還原 ---
   if dba mysql import "$db_name" "$db_user" "$db_pass" "$sql_to_restore"; then
     echo -e "${GREEN}資料庫還原成功！${RESET}"
+
     local confirm
     read -p "是否要做更改網域？[Y/n,預設:N]" confirm
     confirm=${confirm,,}
     confirm=${confirm:-n}
-    if [ $confirm == y ]; then
+    if [ "$confirm" == y ]; then
       read -p "請輸入域名[空白是$domain]" db_domain
       install_wpcli_if_needed
       wp_change_domains "$db_domain" "$domain"
     fi
+
     if ! $is_db_done && $is_from_the_files; then
       is_db_done=true
     fi
-    if [[ "$(dirname "$sql_to_restore")" == "$site_path" ]]; then
-        rm -f "$sql_to_restore"
+
+    if [[ "$sql_to_restore" == "$backup_sql_dir/"* ]]; then
+      rm -f -- "$sql_to_restore"
     fi
+
     return 0
   else
     echo -e "${RED}使用 'dba' 工具還原資料庫失敗！請檢查 'dba' 工具的輸出訊息。${RESET}" >&2
@@ -3189,14 +3211,11 @@ get_input_or_nav() {
 }
 
 show_cert_status() {
-  local target_page="$1"
-  [ -z "$target_page" ] && target_page=1
+  local target_page="${1:-1}"
 
-  local GREEN='\033[0;32m'
-  local BLUE='\033[0;34m'
+  local GREEN='\u001B[0;32m'
+  local BLUE='\u001B[0;34m'
 
-
-  # 環境檢查
   [[ -z "$use_my_app" ]] && check_web_environment
   if [[ $use_my_app != true ]]; then
     echo -e "===== 站點憑證狀態 ====="
@@ -3205,61 +3224,132 @@ show_cert_status() {
     return 0
   fi
 
+  _DW=0
+  _PADDED=""
+  _TRUNCATED=""
+  CERT_END_DATE=""
+
   display_width() {
-    local str="$1"; local width=0; local i=0; local len=${#str}
-    while [ $i -lt $len ]; do
-      local char="${str:$i:1}"
-      if [[ $(printf "%d" "'$char") -gt 127 ]] 2>/dev/null; then width=$((width + 2)); else width=$((width + 1)); fi
-            i=$((i + 1))
+    local str="$1" i ch ord
+    _DW=0
+    for ((i=0; i<${#str}; i++)); do
+      ch="${str:i:1}"
+      LC_CTYPE=C printf -v ord '%d' "'$ch" 2>/dev/null || ord=63
+      (( ord > 127 )) && ((_DW += 2)) || ((_DW += 1))
     done
-    echo $width
   }
+
   pad_str() {
-    local text="$1"; local max="$2"; local align="$3"
-    local w=$(display_width "$text")
-    local pad=$((max - w)); [[ $pad -lt 0 ]] && pad=0
-    local spaces; printf -v spaces "%*s" $pad ""
-    if [[ "$align" == "right" ]]; then echo "${spaces}${text}"; else echo "${text}${spaces}"; fi
+    local text="$1" max="$2" align="$3" pad
+    display_width "$text"
+    pad=$((max - _DW))
+    (( pad < 0 )) && pad=0
+
+    if [[ "$align" == "right" ]]; then
+      printf -v _PADDED "%*s%s" "$pad" "" "$text"
+    else
+      printf -v _PADDED "%s%*s" "$text" "$pad" ""
+    fi
   }
 
   truncate_domain() {
     local d="$1"
     local max_len=28
-    if [ ${#d} -gt $max_len ]; then
+    if (( ${#d} > max_len )); then
       local head="${d:0:5}"
       local tail=".${d##*.}"
-      echo "${head}...${tail}"
+      printf -v _TRUNCATED "%s...%s" "$head" "$tail"
     else
-      echo "$d"
+      _TRUNCATED="$d"
     fi
   }
+
+  get_cert_expiry_noopenssl() {
+    local cert_file="$1"
+    local pem_body raw_dates expiry_raw yy year date_input
+
+    CERT_END_DATE="讀取失敗"
+
+    [[ -f "$cert_file" ]] || {
+      CERT_END_DATE="檔案遺失"
+      return 1
+    }
+
+    pem_body=$(
+      sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$cert_file" \
+      | sed '1d;$d' \
+      | tr -d '
+'
+    )
+
+    [[ -n "$pem_body" ]] || return 1
+
+    raw_dates=$(
+      printf '%s' "$pem_body" \
+      | base64 -d 2>/dev/null \
+      | LC_ALL=C grep -aoE '[0-9]{12}Z|[0-9]{14}Z'
+    )
+
+    expiry_raw=$(printf '%s
+' "$raw_dates" | sed -n '2p')
+    [[ -n "$expiry_raw" ]] || return 1
+
+    if [[ "$expiry_raw" =~ ^[0-9]{12}Z$ ]]; then
+      yy="${expiry_raw:0:2}"
+      if ((10#$yy >= 50)); then
+        year="19$yy"
+      else
+        year="20$yy"
+      fi
+      date_input="${year}-${expiry_raw:2:2}-${expiry_raw:4:2} ${expiry_raw:6:2}:${expiry_raw:8:2}:${expiry_raw:10:2} UTC"
+    else
+      date_input="${expiry_raw:0:4}-${expiry_raw:4:2}-${expiry_raw:6:2} ${expiry_raw:8:2}:${expiry_raw:10:2}:${expiry_raw:12:2} UTC"
+    fi
+
+    CERT_END_DATE=$(date -u -d "$date_input" +"%Y-%m-%d" 2>/dev/null)
+    [[ -n "$CERT_END_DATE" ]] || CERT_END_DATE="讀取失敗"
+    [[ "$CERT_END_DATE" != "讀取失敗" ]]
+  }
+
   local CACHE_DIR="/tmp/site_manager_cert_cache"
-  [ ! -d "$CACHE_DIR" ] && mkdir -p "$CACHE_DIR"
+  [[ ! -d "$CACHE_DIR" ]] && mkdir -p "$CACHE_DIR"
   local NGINX_MAP_CACHE="$CACHE_DIR/nginx_domain_map.cache"
-  local SSL_DATE_CACHE="$CACHE_DIR/ssl_date_info.cache"
-  local SSL_CACHE_TTL=259200
-  local nginx_conf_paths=$(detect_conf_path)
-  local current_ts=$(date +%s)
-    
-  # 1. 讀取域名映射
+
+  local nginx_conf_paths
+  nginx_conf_paths=$(detect_conf_path)
+
   declare -A domain_map
-  local nginx_mod_time=0; [[ -d "$nginx_conf_paths" ]] && nginx_mod_time=$(stat -c %Y "$nginx_conf_paths")
-  local map_mod_time=0; [[ -f "$NGINX_MAP_CACHE" ]] && map_mod_time=$(stat -c %Y "$NGINX_MAP_CACHE")
+  local nginx_mod_time=0
+  [[ -d "$nginx_conf_paths" ]] && nginx_mod_time=$(stat -c %Y "$nginx_conf_paths")
+
+  local map_mod_time=0
+  [[ -f "$NGINX_MAP_CACHE" ]] && map_mod_time=$(stat -c %Y "$NGINX_MAP_CACHE")
 
   if (( map_mod_time >= nginx_mod_time )); then
-    while IFS='|' read -r dom path; do [[ -n "$dom" ]] && domain_map["$dom"]="$path"; done < "$NGINX_MAP_CACHE"
+    while IFS='|' read -r dom path; do
+      [[ -n "$dom" ]] && domain_map["$dom"]="$path"
+    done < "$NGINX_MAP_CACHE"
   else
     > "$NGINX_MAP_CACHE"
     local raw_configs
     if raw_configs=$(grep -rE "server_name|ssl_certificate " "$nginx_conf_paths"/*.conf 2>/dev/null); then
-      local cur_domains=""
+      local cur_domains="" line tmp c_path d
       while read -r line; do
         if [[ "$line" == *"server_name"* ]]; then
-          local tmp=${line#*server_name}; tmp=${tmp%;*}; cur_domains=$(echo "$tmp" | xargs)
+          tmp=${line#*server_name}
+          tmp=${tmp%;*}
+          cur_domains=$(echo "$tmp" | xargs)
         elif [[ "$line" == *"ssl_certificate "* && -n "$cur_domains" ]]; then
-          local c_path=${line#*ssl_certificate}; c_path=${c_path%;*}; c_path=$(echo "$c_path" | xargs)
+          c_path=${line#*ssl_certificate}
+          c_path=${c_path%;*}
+          c_path=$(echo "$c_path" | xargs)
+
           if [[ "$c_path" == /etc/letsencrypt/live/* ]]; then
-            for d in $cur_domains; do [[ -n "$d" ]] && domain_map["$d"]="$c_path" && echo "$d|$c_path" >> "$NGINX_MAP_CACHE"; done
+            for d in $cur_domains; do
+              [[ -n "$d" ]] || continue
+              domain_map["$d"]="$c_path"
+              echo "$d|$c_path" >> "$NGINX_MAP_CACHE"
+            done
           fi
           cur_domains=""
         fi
@@ -3267,128 +3357,126 @@ show_cert_status() {
     fi
   fi
 
-  if [ ${#domain_map[@]} -eq 0 ]; then
+  if (( ${#domain_map[@]} == 0 )); then
     echo -e "${GREEN}目前沒有偵測到任何使用 Let's Encrypt 的域名。${RESET}"
-    TOTAL_PAGES_NGINX=1; return 0
+    TOTAL_PAGES_NGINX=1
+    return 0
   fi
 
-  # 2. 讀取 SSL 快取
-  declare -A ssl_cache_data
-  local cache_dirty=false
-  if [[ -f "$SSL_DATE_CACHE" ]]; then
-    while IFS='|' read -r p d n t; do ssl_cache_data["$p"]="$d|$n|$t"; done < "$SSL_DATE_CACHE"
-  fi
-
-  declare -A unique_paths
-  for d in "${!domain_map[@]}"; do unique_paths["${domain_map[$d]}"]=1; done
-
-  for path in "${!unique_paths[@]}"; do
-    if [[ ! -f "$path" ]]; then ssl_cache_data["$path"]="檔案遺失|需檢查|$current_ts"; continue; fi
-    local cached_info="${ssl_cache_data[$path]}"
-    local need_update=true
-    if [[ -n "$cached_info" ]]; then
-      IFS='|' read -r _ _ last_ts <<< "$cached_info"
-      (( (current_ts - last_ts) < SSL_CACHE_TTL )) && need_update=false
-    fi
-    if [[ "$need_update" == true ]]; then
-      local end_date="讀取失敗"; local note=""
-      local cert_out=$(openssl x509 -in "$path" -noout -enddate -issuer 2>/dev/null)
-      if [[ -n "$cert_out" ]]; then
-        local raw_date=$(echo "$cert_out" | grep 'notAfter' | cut -d= -f2)
-        [[ -n "$raw_date" ]] && end_date=$(date -d "$raw_date" +"%Y-%m-%d")
-        [[ "$cert_out" == *"CloudFlare"* ]] && note="CF 原始憑證"
-      fi
-      ssl_cache_data["$path"]="$end_date|$note|$current_ts"
-      cache_dirty=true
-    fi
-  done
-  if [[ "$cache_dirty" == true ]]; then
-    > "$SSL_DATE_CACHE"
-    for p in "${!ssl_cache_data[@]}"; do echo "$p|${ssl_cache_data[$p]}" >> "$SSL_DATE_CACHE"; done
-  fi
-
-  # 3. 準備渲染資料
   local -a render_rows=()
   local -a sorted_domains
-  IFS=$'\n' sorted_domains=($(sort <<<"${!domain_map[@]}"))
+  IFS=$'
+' sorted_domains=($(sort <<< "${!domain_map[@]}"))
   unset IFS
 
+  local domain path cert_name display_date clean_date note
   for domain in "${sorted_domains[@]}"; do
     [[ -z "$domain" ]] && continue
-    local path="${domain_map[$domain]}"
-    local cert_name=$(basename "$(dirname "$path")")
-    local info="${ssl_cache_data[$path]}"
-    IFS='|' read -r e_date note _ <<< "$info"
-    local display_date="$e_date"
-    if [[ -z "$e_date" ]]; then display_date="${RED}未知${RESET}"; 
-    elif [[ "$e_date" == "檔案遺失" ]]; then display_date="${RED}檔案遺失${RESET}"; 
-    elif [[ "$e_date" == "讀取失敗" ]]; then display_date="${RED}讀取失敗${RESET}"; fi
-    render_rows+=("$domain|$display_date|$cert_name|$note")
+
+    path="${domain_map[$domain]}"
+    cert_name=$(basename "$(dirname "$path")")
+    note=""
+
+    get_cert_expiry_noopenssl "$path"
+
+    case "$CERT_END_DATE" in
+      "")
+        display_date="${RED}未知${RESET}"
+        clean_date="未知"
+        ;;
+      "檔案遺失")
+        display_date="${RED}檔案遺失${RESET}"
+        clean_date="檔案遺失"
+        ;;
+      "讀取失敗")
+        display_date="${RED}讀取失敗${RESET}"
+        clean_date="讀取失敗"
+        ;;
+      *)
+        display_date="$CERT_END_DATE"
+        clean_date="$CERT_END_DATE"
+        ;;
+    esac
+
+    render_rows+=("$domain|$display_date|$clean_date|$cert_name|$note")
   done
 
-    # 4. 分頁計算
-    local total_rows=${#render_rows[@]}
-    local page_size=10
-    TOTAL_PAGES_NGINX=$(( (total_rows + page_size - 1) / page_size ))
-    [[ $TOTAL_PAGES_NGINX -eq 0 ]] && TOTAL_PAGES_NGINX=1
-    
-    if [ "$target_page" -gt "$TOTAL_PAGES_NGINX" ]; then target_page=$TOTAL_PAGES_NGINX; fi
-    if [ "$target_page" -lt 1 ]; then target_page=1; fi
-    CURRENT_PAGE_NGINX=$target_page
+  local total_rows=${#render_rows[@]}
+  local page_size=10
+  TOTAL_PAGES_NGINX=$(( (total_rows + page_size - 1) / page_size ))
+  (( TOTAL_PAGES_NGINX == 0 )) && TOTAL_PAGES_NGINX=1
 
-    local start_index=$(( (target_page - 1) * page_size ))
-    local end_index=$(( start_index + page_size - 1 ))
-    if [ $end_index -ge $total_rows ]; then end_index=$(( total_rows - 1 )); fi
+  (( target_page > TOTAL_PAGES_NGINX )) && target_page=$TOTAL_PAGES_NGINX
+  (( target_page < 1 )) && target_page=1
+  CURRENT_PAGE_NGINX=$target_page
 
-    # 5. 渲染輸出
-    local headers=("域名" "到期日" "憑證資料夾" "備註")
-    local -a col_widths=(0 0 0 0)
-    for i in "${!headers[@]}"; do col_widths[$i]=$(display_width "${headers[$i]}"); done
+  local start_index=$(( (target_page - 1) * page_size ))
+  local end_index=$(( start_index + page_size - 1 ))
+  (( end_index >= total_rows )) && end_index=$(( total_rows - 1 ))
 
-    local -a page_data=()
-    for ((i=start_index; i<=end_index; i++)); do
-        IFS='|' read -r d date c n <<< "${render_rows[$i]}"
-        
-        # 套用新的縮略邏輯
-        local display_d=$(truncate_domain "$d")
-        
-        local clean_date=$(echo -e "$date" | sed "s/\x1B\[[0-9;]*[a-zA-Z]//g")
-        local w_d=${#display_d}
-        local w_date=$(display_width "$clean_date")
-        local w_c=$(display_width "$c")
-        local w_n=$(display_width "$n")
+  local headers=("域名" "到期日" "憑證資料夾" "備註")
+  local -a col_widths=(0 0 0 0)
+  local i
+  for i in "${!headers[@]}"; do
+    display_width "${headers[$i]}"
+    col_widths[$i]=$_DW
+  done
 
-        [ $w_d -gt ${col_widths[0]} ] && col_widths[0]=$w_d
-        [ $w_date -gt ${col_widths[1]} ] && col_widths[1]=$w_date
-        [ $w_c -gt ${col_widths[2]} ] && col_widths[2]=$w_c
-        [ $w_n -gt ${col_widths[3]} ] && col_widths[3]=$w_n
-        
-        page_data+=("$display_d|$date|$c|$n")
-    done
+  local -a page_data=()
+  local display_d w_d w_date w_c w_n
+  for ((i=start_index; i<=end_index; i++)); do
+    IFS='|' read -r domain display_date clean_date cert_name note <<< "${render_rows[$i]}"
 
-    echo -e "===== 站點憑證狀態 ====="
-    local header_line=""
-    for i in {0..3}; do
-        header_line+=$(pad_str "${headers[$i]}" "${col_widths[$i]}" "left")
-        [[ $i -lt 3 ]] && header_line+=" | "
-    done
-    echo -e "${BLUE}${header_line}${RESET}"
+    truncate_domain "$domain"
+    display_d="$_TRUNCATED"
 
-    for row in "${page_data[@]}"; do
-        IFS='|' read -r d date c n <<< "$row"
-        local line=""
-        line+=$(pad_str "$d" "${col_widths[0]}" "left") && line+=" | "
-        
-        local clean_date=$(echo -e "$date" | sed "s/\x1B\[[0-9;]*[a-zA-Z]//g")
-        local pad_len=$(( ${col_widths[1]} - $(display_width "$clean_date") ))
-        line+="$date"; printf -v sp "%*s" $pad_len ""; line+="$sp | "
-        
-        line+=$(pad_str "$c" "${col_widths[2]}" "left") && line+=" | "
-        line+=$(pad_str "$n" "${col_widths[3]}" "left")
-        echo -e "$line"
-    done
-    
-    echo -e "${GRAY}頁碼: $CURRENT_PAGE_NGINX / $TOTAL_PAGES_NGINX${RESET}"
+    display_width "$display_d";  w_d=$_DW
+    display_width "$clean_date"; w_date=$_DW
+    display_width "$cert_name";  w_c=$_DW
+    display_width "$note";       w_n=$_DW
+
+    (( w_d    > col_widths[0] )) && col_widths[0]=$w_d
+    (( w_date > col_widths[1] )) && col_widths[1]=$w_date
+    (( w_c    > col_widths[2] )) && col_widths[2]=$w_c
+    (( w_n    > col_widths[3] )) && col_widths[3]=$w_n
+
+    page_data+=("$display_d|$display_date|$clean_date|$cert_name|$note")
+  done
+
+  echo -e "===== 站點憑證狀態 ====="
+
+  local header_line=""
+  for i in "${!headers[@]}"; do
+    pad_str "${headers[$i]}" "${col_widths[$i]}" "left"
+    header_line+="$_PADDED"
+    (( i < 3 )) && header_line+=" | "
+  done
+  echo -e "${BLUE}${header_line}${RESET}"
+
+  local row line pad_len sp
+  for row in "${page_data[@]}"; do
+    IFS='|' read -r display_d display_date clean_date cert_name note <<< "$row"
+    line=""
+
+    pad_str "$display_d" "${col_widths[0]}" "left"
+    line+="$_PADDED | "
+
+    display_width "$clean_date"
+    pad_len=$(( col_widths[1] - _DW ))
+    (( pad_len < 0 )) && pad_len=0
+    printf -v sp '%*s' "$pad_len" ''
+    line+="${display_date}${sp} | "
+
+    pad_str "$cert_name" "${col_widths[2]}" "left"
+    line+="$_PADDED | "
+
+    pad_str "$note" "${col_widths[3]}" "left"
+    line+="$_PADDED"
+
+    echo -e "$line"
+  done
+
+  echo -e "${GRAY}頁碼: $CURRENT_PAGE_NGINX / $TOTAL_PAGES_NGINX${RESET}"
 }
 
 show_domain_status_caddy() (
@@ -3563,7 +3651,8 @@ ssl_apply() {
   echo "1) DNS API (Cloudflare、DNSPod、Aliyun)"
   echo "2) DNS Manual (手動添加 TXT)"
   echo "3) HTTP (網站目錄驗證)"
-  read -p "選擇 [1-3]（預設 3）:" auth_method
+  echo "4) DNS 永久驗證 (DNS-PERSIST-01)"
+  read -p "選擇 [1-4]（預設 3）:" auth_method
   auth_method="${auth_method:-3}"
 
   case "$auth_method" in
@@ -3671,6 +3760,117 @@ ssl_apply() {
     # 清理並恢復
     rm -f "$detect_conf_path/acme.conf"
     restart_webserver
+    ;;
+  4)
+    # ===== dns-persist 限制檢查 (修正版) =====
+    local base_domain
+    
+    # 統一提取基準點：如果是 *. 開頭就去掉，否則不動
+    if [[ "${domain_array[0]}" == "*."* ]]; then
+      base_domain="${domain_array[0]#*.}"
+    else
+      base_domain="${domain_array[0]}"
+    fi
+
+    for d in "${domain_array[@]}"; do
+      local current_clean
+      if [[ "$d" == "*."* ]]; then
+        current_clean="${d#*.}"
+      else
+        current_clean="$d"
+      fi
+
+      if [[ "$current_clean" != "$base_domain" ]]; then
+        echo -e "${RED}錯誤：dns-persist 只支援同一主網域（含 wildcard）${RESET}"
+        echo -e "偵測到衝突：$current_clean vs $base_domain"
+        sleep 1.5
+        return 1
+      fi
+    done
+
+    # 檢查 wildcard 數量與組合
+    local wildcard_count=0
+    local root_count=0
+
+    for d in "${domain_array[@]}"; do
+      if [[ "$d" == "*."* ]]; then
+        ((wildcard_count++))
+      else
+        ((root_count++))
+      fi
+    done
+
+    # 限制 1：最多只能一個 wildcard
+    if (( wildcard_count > 1 )); then
+      echo -e "${RED}錯誤：只允許一個 wildcard 網域${RESET}"
+      return 1
+    fi
+
+    # 限制 2：修正後的邏輯
+    # 允許的情況：(1個 wildcard + 0個 root) OR (1個 wildcard + 1個 root)
+    # 不允許的情況：wildcard 存在但 root 數量不對，或者完全沒有 wildcard
+    if (( wildcard_count == 1 )); then
+      if (( root_count > 1 )); then
+         echo -e "${RED}錯誤：wildcard 模式下最多只能包含一個對應的主網域${RESET}"
+         return 1
+      fi
+    else
+      echo -e "${RED}錯誤：dns-persist 模式必須包含一個 wildcard 網域${RESET}"
+      return 1
+    fi
+
+    # ===== 產生並獲取 DNS Persist 資訊 =====
+    # 建立一個安全的暫存檔來接 acme.sh 的輸出，避免使用子 shell $()
+    local tmp_log
+    tmp_log=$(mktemp)
+
+    # 在當前 shell 執行，輸出導向至暫存檔
+    acme.sh --make-dns-persist-value "${domain_args[@]}" > "$tmp_log" 2>/dev/null
+
+    # 從暫存檔提取變數 (awk 執行在子 shell 沒關係，因為已經不是 acme.sh 本體了)
+    persist_domain=$(awk '/TXT persist domain:/ {sub(/.*domain:/, ""); print $0}' "$tmp_log" | tr -d '[:space:]')
+    persist_value=$(awk -F'"' '/TXT persist value :/ {print $2}' "$tmp_log")
+
+    # 用完即刪，保持環境乾淨
+    rm -f "$tmp_log"
+
+    # 檢查是否成功抓到變數
+    if [[ -z "$persist_domain" || -z "$persist_value" ]]; then
+      echo -e "${RED}錯誤：無法獲取驗證值，請檢查 acme.sh 執行狀態${RESET}"
+      return 1
+    fi
+
+    echo "DNS目標：$persist_domain"
+    echo "類型：TXT"
+    echo "值：$persist_value"
+    
+    read -p "請先新增記錄後按下 Enter"
+    local success=0
+    local check1
+    local check2
+
+    for ((i=1; i<=20; i++)); do
+      echo "第 $i 次檢查 (使用 nslookup)..."
+
+      # 使用 nslookup 查詢並用 grep 精確過濾出我們要的 value
+      check1=$(nslookup -type=TXT "$persist_domain" 1.1.1.1 2>/dev/null | grep "text =" | grep -F "$persist_value")
+      check2=$(nslookup -type=TXT "$persist_domain" 9.9.9.9 2>/dev/null | grep "text =" | grep -F "$persist_value")
+
+      if [[ -n "$check1" && -n "$check2" ]]; then
+        echo -e "${GREEN}DNS 驗證成功${RESET}"
+        success=1
+        break
+      else
+        echo "尚未同步（1.1.1.1 或 9.9.9.9 未見記錄），10 秒後重試..."
+        sleep 10
+      fi
+    done
+
+    if [[ $success -ne 1 ]]; then
+      echo -e "${RED}錯誤：DNS 傳播檢查失敗（200 秒內未生效）${RESET}"
+      return 1
+    fi
+    exit 0
     ;;
     
   *) echo "無效的選擇。" >&2; return 1 ;;
