@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.4.5"
+version="8.4.6"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -4215,6 +4215,140 @@ self_signed_certificate()(
   fi
 )
 
+update_web_server_docker() {
+    # 1. 使用你定義好的全域變數 $docker_name
+    local container_name="$docker_name"
+
+    if [[ -z "$container_name" ]]; then
+        echo -e "${RED}錯誤：未定義 docker_name 變量。${RESET}"
+        exit 1
+    fi
+
+    if ! docker inspect "$container_name" &>/dev/null; then
+        echo -e "${RED}容器 $container_name 不存在，無法更新。${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN}正在分析 $container_name 參數...${RESET}"
+
+    local image=$(docker inspect -f '{{.Config.Image}}' "$container_name")
+    local old_image_id=$(docker inspect -f '{{.Image}}' "$container_name")
+
+    echo -e "${CYAN}正在拉取鏡像 $image ...${RESET}"
+    pull_output=$(docker pull "$image" 2>&1)
+    pull_status=$?
+
+    if [[ $pull_status -ne 0 ]]; then
+        echo -e "${RED}拉取鏡像失敗：$pull_output${RESET}"
+        sleep 1
+        return 1
+    fi
+
+    if echo "$pull_output" | grep -qi "up to date"; then
+        echo -e "${GREEN}$image 已是最新版本，無需更新容器。${RESET}"
+        sleep 1
+        return 0
+    fi
+
+    echo -e "${CYAN}已下載新版 $image，開始擷取 Web Server 必要配置...${RESET}"
+
+    # --- 擷取指定配置 ---
+    
+    # 埠口映射 (Ports)
+    declare -A seen_ports
+    port_args=""
+    while IFS= read -r line; do
+      container_port=$(echo "$line" | awk '{print $1}' | cut -d'/' -f1)
+      if [[ -n "${seen_ports[$container_port]}" ]]; then continue; fi
+      seen_ports[$container_port]=1
+      host_port=$(echo "$line" | awk '{print $NF}' | cut -d':' -f2)
+      if [[ -n "$host_port" && -n "$container_port" ]]; then
+        port_args="$port_args -p ${host_port}:${container_port}"
+      fi
+    done < <(docker port "$container_name")
+
+    # 儲存 (Volumes)、環境變數 (Env)、標籤 (Labels)
+    local volumes=$(docker inspect -f '{{range .Mounts}}-v {{.Source}}:{{.Destination}} {{end}}' "$container_name")
+    local envs=$(docker inspect -f '{{range $index, $value := .Config.Env}}-e {{$value}} {{end}}' "$container_name")
+    local labels=$(docker inspect -f '{{range $k, $v := .Config.Labels}}--label {{$k}}="{{$v}}" {{end}}' "$container_name" 2>/dev/null)
+
+    # 重啟策略 (Restart Policy)
+    local restart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$container_name")
+    local restart_arg=""
+    if [[ "$restart" != "no" && -n "$restart" ]]; then
+        restart_arg="--restart=$restart"
+    fi
+
+    # 網路 (Network)
+    local network=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$container_name" | head -n1)
+    local network_arg=""
+    if [[ -n "$network" ]]; then
+        network_arg="--network=$network"
+    fi
+
+    # 使用者 (User)
+    local user=$(docker inspect -f '{{.Config.User}}' "$container_name")
+    local user_arg=""
+    if [[ -n "$user" ]]; then user_arg="--user $user"; fi
+
+    # --init
+    local has_init=$(docker inspect -f '{{.HostConfig.Init}}' "$container_name" 2>/dev/null)
+    local init_arg=""
+    if [[ "$has_init" == "true" ]]; then init_arg="--init"; fi
+
+    # --privileged (特權模式)
+    local is_privileged=$(docker inspect -f '{{.HostConfig.Privileged}}' "$container_name" 2>/dev/null)
+    local priv_arg=""
+    if [[ "$is_privileged" == "true" ]]; then priv_arg="--privileged"; fi
+
+    # --- 重建容器 ---
+    docker stop "$container_name"
+    docker rm "$container_name"
+
+    # 運行新容器（僅保留你指定的參數）
+    docker run -d --name "$container_name" \
+      $restart_arg $network_arg $port_args $volumes $envs $labels $user_arg $init_arg $priv_arg \
+      "$image"
+
+    # --- 10秒週期 監聽 80 與 443 埠口 ---
+    echo -e "${CYAN}容器已啟動，正在驗證 80 與 443 埠口服務狀態...${RESET}"
+    
+    local success=false
+    for i in {1..10}; do
+        echo -e "${CYAN}第 $i 次檢查 (每 10 秒檢查一次)...${RESET}"
+        
+        # 精準比對：本機是否同時有 :80 與 :443 在監聽
+        if ss -tuln | grep -qE ':80 ' && ss -tuln | grep -qE ':443 '; then
+            success=true
+            break
+        fi
+        
+        sleep 10
+    done
+
+    # --- 判斷結果 ---
+    if [ "$success" = true ]; then
+        echo -e "${GREEN}$container_name 已成功更新並順利運行（80/443 埠口已就緒）。${RESET}"
+        
+        # 清理舊鏡像
+        local new_image_id=$(docker inspect -f '{{.Image}}' "$container_name")
+        if [[ "$old_image_id" != "$new_image_id" ]]; then
+            docker rmi "$old_image_id" 2>/dev/null || true
+        fi
+        return 0
+    else
+        echo -e "${RED}錯誤：容器雖然啟動，但 80/443 埠口在 100 秒內未能成功建立監聽！${RESET}"
+        echo -e "${RED}以下為容器前 100 行日誌：${RESET}"
+        echo -e "--------------------------------------------------"
+        docker logs "$container_name" 2>&1 | head -n 100
+        echo -e "--------------------------------------------------"
+        echo -e "${RED}更新失敗，直接結束腳本。${RESET}"
+        exit 1
+    fi
+}
+
+
+
 
 # 菜單
 
@@ -4919,10 +5053,18 @@ show_menu_nginx(){
     echo ""
     echo -e "${GREEN}9.${RESET} Docker安裝及管理"
     echo ""
+    if [[ -n "$docker_name" ]]; then
+      echo -e "${GREEN}10.${RESET} 升級網頁伺服器【僅限docker】"
+      echo ""
+    fi
     echo -e "${BLUE}u.${RESET} 更新腳本           ${RED}0.${RESET} 離開"
     echo "-------------------"
     echo -e "${GRAY}[←/→] 翻頁  [數字] 選擇選單${RESET}"
-    echo -n -e "${YELLOW}請選擇操作 [1-9 / i u 0]: ${RESET}"
+    if [[ -n $docker_name ]]; then
+      echo -n -e "${YELLOW}請選擇操作 [1-10 / i u 0]: ${RESET}"
+    else
+      echo -n -e "${YELLOW}請選擇操作 [1-9 / i u 0]: ${RESET}"
+    fi
 
     # 3. 獲取輸入 (異步)
     # 這邊 stdout 會拿到純淨的結果，視覺回顯走 stderr
@@ -4987,6 +5129,11 @@ show_menu_nginx(){
       if ! command -v d >/dev/null 2>&1; then
         bash <(curl -sL https://gitlab.com/gebu8f/sh/-/raw/main/docker/install.sh)
       else d; fi
+      ;;
+    10)
+      if [[ -n "$docker_name" ]]; then
+        update_web_server_docker
+      fi
       ;;
     0)
       exit 0
@@ -5087,7 +5234,7 @@ if [ $# -ne 0 ]; then
     ;;
   esac
 fi
-if [ $caddy -eq 1 ]; then
+if [[ "$caddy" -eq 1 ]]; then
   show_menu_caddy
 else
   trap 'stty echo; exit' INT TERM
