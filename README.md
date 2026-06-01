@@ -78,7 +78,7 @@
 
 畫面:
 
-![site](https://img.gebu8f.com/site.jpg)
+![site](https://img.gebu8f.page/site.jpg)
 
 ---
 
