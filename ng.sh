@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 # 版本
-version="8.4.6"
+version="8.4.9"
 
 #變量
 CURRENT_PAGE_NGINX=1
@@ -1511,6 +1511,10 @@ flarum_setup() {
   local db_name="flarum_$(echo $domain | sed 's/\./_/g; s/-//g')"
   local db_user="${db_name}_user"
   local db_pass=$(dba mysql add $db_name $db_user false)
+  local tmp_file="$(mktemp)"
+  dba search_db > "$tmp_file" 2>/dev/null
+  local mode="$(tail -n1 "$tmp_file" | cut -d';' -f1 | xargs)"
+  rm -f "$tmp_file"
 
   # 下載 Flarum
   mkdir -p /var/www/$domain
@@ -1549,6 +1553,9 @@ flarum_setup() {
   echo "資料庫名稱：$db_name"
   echo "資料庫用戶：$db_user"
   echo "資料庫密碼：$db_pass"
+  if [[ "$mode" == "docker" ]]; then
+    echo "資料庫主機：127.0.0.1（一定要這樣，因為才會走tcp連線）"
+  fi
   echo "請在安裝介面輸入以上資訊完成安裝。"
   echo "======================="
 }
@@ -3306,7 +3313,7 @@ show_cert_status() {
       date_input="${expiry_raw:0:4}-${expiry_raw:4:2}-${expiry_raw:6:2} ${expiry_raw:8:2}:${expiry_raw:10:2}:${expiry_raw:12:2} UTC"
     fi
 
-    CERT_END_DATE=$(date -u -d "$date_input" +"%Y-%m-%d" 2>/dev/null)
+    CERT_END_DATE=$(date -d "$date_input" +"%Y-%m-%d %H:%M:%S (UTC%:z)" 2>/dev/null)
     [[ -n "$CERT_END_DATE" ]] || CERT_END_DATE="讀取失敗"
     [[ "$CERT_END_DATE" != "讀取失敗" ]]
   }
@@ -4124,13 +4131,21 @@ wordpress_site() {
     local db_name="wp_$(echo $domain | sed 's/\./_/g; s/-//g')"
     local db_user="${db_name}_user"
     local db_pass=$(dba mysql add $db_name $db_user false)
+    local tmp_file="$(mktemp)"
+    dba search_db > "$tmp_file" 2>/dev/null
+    local mode="$(tail -n1 "$tmp_file" | cut -d';' -f1 | xargs)"
+    rm -f "$tmp_file"
 
     # 設定 wp-config.php
     cp "/var/www/$domain/wp-config-sample.php" "$wp_config"
     sed -i "s/database_name_here/$db_name/" "$wp_config"
     sed -i "s/username_here/$db_user/" "$wp_config"
     sed -i "s/password_here/$db_pass/" "$wp_config"
-    sed -i "s/localhost/localhost/" "$wp_config"
+    if [[ $mode == docker ]]; then
+      sed -i "s/localhost/127.0.0.1/" "$wp_config"
+    else
+      sed -i "s/localhost/localhost/" "$wp_config"
+    fi
     # 安全金鑰
     if command -v wp >/dev/null 2>&1; then
       wp config shuffle-salts --path="/var/www/$domain" --allow-root
@@ -4252,63 +4267,41 @@ update_web_server_docker() {
 
     echo -e "${CYAN}已下載新版 $image，開始擷取 Web Server 必要配置...${RESET}"
 
-    # --- 擷取指定配置 ---
-    
-    # 埠口映射 (Ports)
-    declare -A seen_ports
-    port_args=""
-    while IFS= read -r line; do
-      container_port=$(echo "$line" | awk '{print $1}' | cut -d'/' -f1)
-      if [[ -n "${seen_ports[$container_port]}" ]]; then continue; fi
-      seen_ports[$container_port]=1
-      host_port=$(echo "$line" | awk '{print $NF}' | cut -d':' -f2)
-      if [[ -n "$host_port" && -n "$container_port" ]]; then
-        port_args="$port_args -p ${host_port}:${container_port}"
-      fi
-    done < <(docker port "$container_name")
+    # --- 僅擷取最核心配置（使用陣列處理，確保空白安全） ---
+    local run_args=()
 
-    # 儲存 (Volumes)、環境變數 (Env)、標籤 (Labels)
-    local volumes=$(docker inspect -f '{{range .Mounts}}-v {{.Source}}:{{.Destination}} {{end}}' "$container_name")
-    local envs=$(docker inspect -f '{{range $index, $value := .Config.Env}}-e {{$value}} {{end}}' "$container_name")
-    local labels=$(docker inspect -f '{{range $k, $v := .Config.Labels}}--label {{$k}}="{{$v}}" {{end}}' "$container_name" 2>/dev/null)
+    # 1. 儲存卷 (Volumes) - 完美保留你的 :ro 唯讀設定
+    while IFS= read -r vol; do
+        if [[ -n "$vol" ]]; then
+            run_args+=("-v" "$vol")
+        fi
+    done < <(docker inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}}{{if .RW}}{{else}}:ro{{end}}{{"\n"}}{{end}}' "$container_name")
 
-    # 重啟策略 (Restart Policy)
+    # 2. 重啟策略 (Restart Policy)
     local restart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$container_name")
-    local restart_arg=""
     if [[ "$restart" != "no" && -n "$restart" ]]; then
-        restart_arg="--restart=$restart"
+        run_args+=("--restart=$restart")
     fi
 
-    # 網路 (Network)
+    # 3. 網路模式 (Network)
     local network=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$container_name" | head -n1)
-    local network_arg=""
     if [[ -n "$network" ]]; then
-        network_arg="--network=$network"
+        run_args+=("--network=$network")
     fi
 
-    # 使用者 (User)
-    local user=$(docker inspect -f '{{.Config.User}}' "$container_name")
-    local user_arg=""
-    if [[ -n "$user" ]]; then user_arg="--user $user"; fi
-
-    # --init
+    # 4. --init 參數
     local has_init=$(docker inspect -f '{{.HostConfig.Init}}' "$container_name" 2>/dev/null)
-    local init_arg=""
-    if [[ "$has_init" == "true" ]]; then init_arg="--init"; fi
-
-    # --privileged (特權模式)
-    local is_privileged=$(docker inspect -f '{{.HostConfig.Privileged}}' "$container_name" 2>/dev/null)
-    local priv_arg=""
-    if [[ "$is_privileged" == "true" ]]; then priv_arg="--privileged"; fi
+    if [[ "$has_init" == "true" ]]; then 
+        run_args+=("--init")
+    fi
 
     # --- 重建容器 ---
-    docker stop "$container_name"
-    docker rm "$container_name"
+    echo -e "${CYAN}正在停止並刪除舊容器...${RESET}"
+    docker stop "$container_name" &>/dev/null
+    docker rm "$container_name" &>/dev/null
 
-    # 運行新容器（僅保留你指定的參數）
-    docker run -d --name "$container_name" \
-      $restart_arg $network_arg $port_args $volumes $envs $labels $user_arg $init_arg $priv_arg \
-      "$image"
+    echo -e "${GREEN}正在啟動新容器...${RESET}"
+    docker run -d --name "$container_name" "${run_args[@]}" "$image"
 
     # --- 10秒週期 監聽 80 與 443 埠口 ---
     echo -e "${CYAN}容器已啟動，正在驗證 80 與 443 埠口服務狀態...${RESET}"
@@ -4346,6 +4339,7 @@ update_web_server_docker() {
         exit 1
     fi
 }
+
 
 
 
